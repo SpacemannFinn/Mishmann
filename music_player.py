@@ -1,5 +1,6 @@
 import os
 import time
+import subprocess
 import spidev
 import gpiod
 import math
@@ -16,6 +17,20 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
 from bt_manager import BluetoothManager, BluetoothUnavailable
+from upload_server import MusicUploadServer
+
+
+# ================================
+# DEBUG LOGGING
+# Tagged prints so on-device output can be grepped per-section, e.g.
+# `python3 music_player.py | grep '\[BT\]'` to isolate Bluetooth activity,
+# or `| grep '\[MENU\]'` while debugging navigation. Timestamped (seconds
+# since script start) so timing between events is visible at a glance.
+# ================================
+_LOG_T0 = time.monotonic()
+
+def log(tag, msg):
+    print(f"[{time.monotonic() - _LOG_T0:8.3f}] [{tag}] {msg}", flush=True)
 
 # ================================
 # GSTREAMER AUDIO PLAYER
@@ -190,6 +205,9 @@ btn_next_line.request(consumer="btn-next", type=gpiod.LINE_REQ_DIR_IN)
 btn_prev_line.request(consumer="btn-prev", type=gpiod.LINE_REQ_DIR_IN)
 btn_vol_up_line.request(consumer="btn-volup", type=gpiod.LINE_REQ_DIR_IN)
 btn_vol_down_line.request(consumer="btn-voldown", type=gpiod.LINE_REQ_DIR_IN)
+log("GPIO", f"chip={CHIP_NAME} dc={DC_LINE} rst={RESET_LINE} "
+            f"buttons=(play={PLAY_PAUSE_BTN_LINE},next={NEXT_BTN_LINE},"
+            f"prev={PREV_BTN_LINE},vol_up={VOL_UP_BTN_LINE},vol_down={VOL_DOWN_BTN_LINE}) requested OK")
 
 
 # ================================
@@ -234,18 +252,21 @@ class Backlight:
                 with open(f"{self.chip_path}/export", "w") as f:
                     f.write(str(self.channel))
                 time.sleep(0.05)  # sysfs needs a moment to create the directory
+                log("BACKLIGHT", f"exported channel {self.channel} on {self.chip_path}")
             self._write("period", self.period_ns)
             self._write("duty_cycle", 0)   # 0 duty = full bright (inverted)
             self._write("enable", 1)
             self._available = True
+            log("BACKLIGHT", f"PWM ready: {self._pwm_path}, period={self.period_ns}ns")
         except Exception as e:
-            print(f"WARNING: backlight PWM unavailable ({e}); "
-                  f"screen will stay at whatever brightness it powered on with.")
+            log("BACKLIGHT", f"WARNING: PWM unavailable ({e}); "
+                              f"screen will stay at whatever brightness it powered on with.")
             self._available = False
 
     def set_brightness(self, percent):
         """0 = off (screen dark), 100 = full bright. Clamped to [0, 100]."""
         percent = max(0, min(100, percent))
+        changed = percent != self._brightness
         self._brightness = percent
         if not self._available:
             return
@@ -255,8 +276,10 @@ class Backlight:
         duty = int(round((100 - percent) / 100.0 * self.period_ns))
         try:
             self._write("duty_cycle", duty)
+            if changed:
+                log("BACKLIGHT", f"brightness -> {percent}%  (duty_cycle={duty})")
         except Exception as e:
-            print(f"WARNING: failed to set backlight brightness: {e}")
+            log("BACKLIGHT", f"WARNING: failed to set backlight brightness: {e}")
 
     def get_brightness(self):
         return self._brightness
@@ -271,6 +294,7 @@ class Backlight:
         target = max(0, min(100, target_percent))
         if start == target:
             return
+        log("BACKLIGHT", f"fade {start}% -> {target}% over {duration_s}s")
         delay = duration_s / max(1, steps)
         for i in range(1, steps + 1):
             self.set_brightness(start + (target - start) * i / steps)
@@ -289,8 +313,9 @@ class Backlight:
         try:
             self._write("duty_cycle", 0)  # leave the screen bright, not stuck dark
             self._write("enable", 0)
-        except Exception:
-            pass
+            log("BACKLIGHT", "shutdown: PWM disabled, left at full bright for next boot")
+        except Exception as e:
+            log("BACKLIGHT", f"WARNING: shutdown cleanup failed: {e}")
 
 
 backlight = Backlight()
@@ -550,6 +575,70 @@ class SpoolAnimator:
 # ================================
 # UI DRAWING: COMPOSITED LAYOUT 5
 # ================================
+# ================================
+# UI DRAWING: COMPOSITED LAYOUT 5
+# ================================
+def draw_shuffle_icon(x, y, size, color, bg, active):
+    """
+    Draws a small shuffle glyph with supersampled anti-aliasing so the 
+    diagonal lines look buttery smooth instead of jagged. Features a 
+    professional 'crossover' gap in the center.
+    """
+    # Determine foreground color (dimmed if inactive)
+    fg = color if active else tuple(int(c * 0.4 + bg_c * 0.6) for c, bg_c in zip(color, bg))
+
+    # Supersample scale: draw 4x larger, then resize down for anti-aliasing
+    scale = 4
+    big_size = size * scale
+    img = Image.new("RGB", (big_size, big_size), bg)
+    draw = ImageDraw.Draw(img)
+
+    w = big_size
+    line_w = 2 * scale
+
+    # Anchor points for the paths
+    left_x = w * 0.15
+    mid_l  = w * 0.35
+    mid_r  = w * 0.65
+    right_x = w * 0.80
+    top_y  = w * 0.30
+    bot_y  = w * 0.70
+
+    # Draw path 1: Top-Left to Bottom-Right
+    draw.line([(left_x, top_y), (mid_l, top_y), (mid_r, bot_y), (right_x, bot_y)], fill=fg, width=line_w, joint="curve")
+    
+    # Erase a small circle in the middle to create the overlapping gap
+    gap_r = line_w * 1.5
+    draw.ellipse([w*0.5 - gap_r, w*0.5 - gap_r, w*0.5 + gap_r, w*0.5 + gap_r], fill=bg)
+
+    # Draw path 2: Bottom-Left to Top-Right
+    draw.line([(left_x, bot_y), (mid_l, bot_y), (mid_r, top_y), (right_x, top_y)], fill=fg, width=line_w, joint="curve")
+
+    # Arrowheads
+    ah_l = w * 0.18  # length
+    ah_h = w * 0.14  # half-height
+    
+    # Bottom-right arrowhead
+    draw.polygon([
+        (right_x + ah_l*0.6, bot_y),
+        (right_x - ah_l*0.4, bot_y - ah_h),
+        (right_x - ah_l*0.4, bot_y + ah_h)
+    ], fill=fg)
+    
+    # Top-right arrowhead
+    draw.polygon([
+        (right_x + ah_l*0.6, top_y),
+        (right_x - ah_l*0.4, top_y - ah_h),
+        (right_x - ah_l*0.4, top_y + ah_h)
+    ], fill=fg)
+
+    # Scale down to original size using Lanczos for perfect anti-aliasing
+    img = img.resize((size, size), Image.LANCZOS)
+
+    blit_rect_buf(x, y, size, size, img.tobytes())
+
+
+
 def draw_background_and_layout(track):
     theme = track.get("theme")
     bg = theme["bg"]
@@ -574,7 +663,9 @@ def draw_background_and_layout(track):
         "album_size": album_size, "album_x": album_x, "album_y": album_y,
         "spool1_x": spool1_x, "spool2_x": spool2_x, "spool_y": spool_y, "spool_size": spool_size,
         "tape_x": tape_x, "tape_y": tape_y, "tape_w": tape_w, "tape_h": tape_h,
-        "animator": SpoolAnimator(spool_size, theme["accent"], bg)
+        "animator": SpoolAnimator(spool_size, theme["accent"], bg),
+        "shuffle_icon_x": WIDTH - 20 - 22, "shuffle_icon_y": 16, "shuffle_icon_size": 22,
+        "shuffle_active": False,
     }
 
     # Extract & Resize Album Art using PIL
@@ -648,7 +739,21 @@ def draw_background_and_layout(track):
         "vol_x": (WIDTH - vol_w) // 2, "vol_y": album_y + (album_size // 2) - 5, 
         "vol_w": vol_w, "vol_h": vol_h, "last_vol": -1.0
     })
+
+    draw_shuffle_icon(layout["shuffle_icon_x"], layout["shuffle_icon_y"],
+                       layout["shuffle_icon_size"], theme["accent"], bg, active=False)
     return layout
+
+def update_shuffle_icon(layout, active):
+    """Redraw the shuffle icon only if its on/off state actually changed —
+    avoids an SPI write every frame for something that changes rarely."""
+    if layout.get("shuffle_active") == active:
+        return
+    layout["shuffle_active"] = active
+    draw_shuffle_icon(layout["shuffle_icon_x"], layout["shuffle_icon_y"],
+                       layout["shuffle_icon_size"], layout["theme"]["accent"],
+                       layout["bg"], active=active)
+    log("PLAYBACK", f"shuffle icon redrawn: {'ON' if active else 'OFF'}")
 
 def update_progress_bar(layout, progress):
     progress = max(0.0, min(1.0, progress))
@@ -757,13 +862,20 @@ ROW_H = 42
 HEADER_H = 50
 
 
+SECTION_MARKER = "__section__"
+SECTION_H = 26   # shorter than a normal row — it's a label, not a row
+
+
 def render_list_screen(title, items, selected_index, footer=None):
     """
     Build (not blit) one full-screen PIL image for a simple scrollable list
     menu: a header, then rows, with the selected row highlighted. Returns the
     Image so callers can blit it in one shot.
 
-    items: list of (label, subtext_or_None) tuples.
+    items: list of (label, subtext_or_None) tuples, OR (SECTION_MARKER,
+    section_title) to render a non-selectable section divider (e.g. "PAIRED",
+    "AVAILABLE"). selected_index indexes only the *selectable* rows — section
+    markers are skipped when mapping selection to a screen position.
     """
     img = Image.new("RGB", (WIDTH, HEIGHT), MENU_BG)
     draw = ImageDraw.Draw(img)
@@ -772,35 +884,56 @@ def render_list_screen(title, items, selected_index, footer=None):
         title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
         row_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 17)
         sub_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13)
+        section_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 12)
     except Exception:
-        title_font = row_font = sub_font = ImageFont.load_default()
+        title_font = row_font = sub_font = section_font = ImageFont.load_default()
 
     # Header
     draw.text((20, 14), title, font=title_font, fill=MENU_TEXT)
     draw.rectangle([0, HEADER_H - 1, WIDTH, HEADER_H - 1], fill=(50, 50, 58))
     draw.rectangle([20, HEADER_H - 4, 60, HEADER_H - 2], fill=MENU_ACCENT)
 
-    # How many rows fit on screen, and scroll so the selection stays visible.
-    visible_rows = max(1, (HEIGHT - HEADER_H - (28 if footer else 6)) // ROW_H)
-    if len(items) <= visible_rows:
-        scroll = 0
-    else:
-        scroll = max(0, min(selected_index - visible_rows // 2, len(items) - visible_rows))
+    heights = [SECTION_H if it[0] == SECTION_MARKER else ROW_H for it in items]
+    sel_positions = [i for i, it in enumerate(items) if it[0] != SECTION_MARKER]
 
-    for i in range(scroll, min(len(items), scroll + visible_rows)):
-        label, subtext = items[i]
-        row_y = HEADER_H + (i - scroll) * ROW_H
-        is_sel = (i == selected_index)
+    avail_h = HEIGHT - HEADER_H - (28 if footer else 6)
 
-        if is_sel:
-            draw.rectangle([0, row_y, WIDTH, row_y + ROW_H - 1], fill=MENU_HILITE_BG)
-            draw.rectangle([0, row_y, 4, row_y + ROW_H - 1], fill=MENU_ACCENT)
+    target_item_idx = sel_positions[selected_index] if sel_positions else 0
+    scroll_px = 0
+    if sum(heights) > avail_h:
+        y_of_target = sum(heights[:target_item_idx])
+        scroll_px = max(0, min(y_of_target - avail_h // 2, sum(heights) - avail_h))
 
-        text_color = MENU_TEXT if is_sel else MENU_SUBTEXT
-        ty = row_y + (8 if subtext else 12)
-        draw.text((24, ty), label, font=row_font, fill=text_color)
-        if subtext:
-            draw.text((24, ty + 19), subtext, font=sub_font, fill=MENU_SUBTEXT)
+    y = HEADER_H - scroll_px
+    for i, it in enumerate(items):
+        h = heights[i]
+        if y + h <= HEADER_H:
+            y += h
+            continue
+        if y >= HEIGHT - (28 if footer else 0):
+            break
+
+        # Clip: never draw above the header bar, even if this row is only
+        # partially scrolled into it — avoids a section label or highlight
+        # bar bleeding into the title area.
+        if y < HEADER_H:
+            y += h
+            continue
+
+        if it[0] == SECTION_MARKER:
+            draw.text((24, y + 6), it[1], font=section_font, fill=MENU_ACCENT)
+        else:
+            label, subtext = it
+            is_sel = (i == target_item_idx)
+            if is_sel:
+                draw.rectangle([0, y, WIDTH, y + h - 1], fill=MENU_HILITE_BG)
+                draw.rectangle([0, y, 4, y + h - 1], fill=MENU_ACCENT)
+            text_color = MENU_TEXT if is_sel else MENU_SUBTEXT
+            ty = y + (8 if subtext else 12)
+            draw.text((24, ty), label, font=row_font, fill=text_color)
+            if subtext:
+                draw.text((24, ty + 19), subtext, font=sub_font, fill=MENU_SUBTEXT)
+        y += h
 
     if footer:
         draw.rectangle([0, HEIGHT - 26, WIDTH, HEIGHT - 26], fill=(50, 50, 58))
@@ -822,6 +955,75 @@ def _bt_device_label(dev):
     return name, sub
 
 
+_WPCTL_TIMEOUT_S = 2.0  # never let a hung/missing wpctl stall the Settings screen
+
+def get_active_bt_codec():
+    """
+    Best-effort lookup of the codec currently negotiated for the connected
+    Bluetooth audio sink (e.g. 'ldac', 'aac', 'sbc'), via wpctl/PipeWire —
+    this is genuinely where codec negotiation happens; it isn't something
+    this app controls or can force, only observe. Returns a human-readable
+    string, or a clear status string ("No device connected", "Unknown", etc)
+    if anything about the lookup fails — this must never raise, since it's
+    called every time the Settings screen redraws.
+    """
+    try:
+        status = subprocess.run(
+            ["wpctl", "status"], capture_output=True, text=True,
+            timeout=_WPCTL_TIMEOUT_S,
+        )
+        if status.returncode != 0:
+            return "Unknown (wpctl unavailable)"
+
+        # Find the default (starred) sink line under "Sinks:" — that's the
+        # currently active output. Bluetooth sink names from PipeWire look
+        # like "  *   46. WH-1000XM4    [vol: 0.98]".
+        sink_id = None
+        in_sinks = False
+        for line in status.stdout.splitlines():
+            stripped = line.strip()
+            if "Sinks:" in stripped:
+                in_sinks = True
+                continue
+            if in_sinks:
+                if "Sink endpoints:" in stripped or "Sources:" in stripped:
+                    break
+                if "*" in line:
+                    # e.g. "│  *   46. WH-1000XM4    [vol: 0.98]"
+                    after_star = line.split("*", 1)[1].strip()
+                    sink_id = after_star.split(".", 1)[0].strip()
+                    break
+
+        if not sink_id:
+            return "No device connected"
+
+        inspect = subprocess.run(
+            ["wpctl", "inspect", sink_id], capture_output=True, text=True,
+            timeout=_WPCTL_TIMEOUT_S,
+        )
+        if inspect.returncode != 0:
+            return "Unknown"
+
+        for line in inspect.stdout.splitlines():
+            if "api.bluez5.codec" in line:
+                # e.g. '     api.bluez5.codec = "ldac"'
+                codec = line.split("=", 1)[1].strip().strip('"')
+                return codec.upper()
+
+        # Sink exists but has no bluez5 codec property — almost certainly
+        # the built-in analog output, not a Bluetooth device, so there's no
+        # codec concept here at all rather than something unknown/broken.
+        return "Not a Bluetooth device"
+
+    except FileNotFoundError:
+        return "Unknown (wpctl not installed)"
+    except subprocess.TimeoutExpired:
+        return "Unknown (timed out)"
+    except Exception as e:
+        log("BT", f"codec lookup failed: {e}")
+        return "Unknown"
+
+
 def _is_named(dev):
     """A device counts as 'named' if BlueZ resolved a friendly name distinct
     from its bare MAC address — the common case for anything actually worth
@@ -831,10 +1033,15 @@ def _is_named(dev):
 
 def run_bluetooth_screen(bt, buttons):
     """
-    Bluetooth settings screen: scan, list devices (named-only by default,
-    toggle for all), pair/connect/trust the selected one. Returns when the
-    user backs out (Prev hold).
+    Bluetooth settings screen with two sections:
+      PAIRED    — devices BlueZ already remembers (its own persisted
+                  pairing/link-key storage at /var/lib/bluetooth — nothing
+                  new to store here). Connect / Disconnect / Forget.
+      AVAILABLE — live scan results, named-only by default with a toggle to
+                  reveal anonymous/unnamed devices too. Pair to add one.
+    Returns when the user backs out (Prev hold, or Play/Pause hold).
     """
+    log("BT", "entered Bluetooth screen, starting scan")
     show_all = False
     selected = 0
     status_msg = None
@@ -846,32 +1053,63 @@ def run_bluetooth_screen(bt, buttons):
     while True:
         now = time.monotonic()
 
-        # Drain backend events; update status line on pair/connect results.
         for kind, payload in bt.get_events():
-            if kind == "pair_result" and payload.get("address") == last_action_addr:
+            addr = payload.get("address") if isinstance(payload, dict) else None
+            log("BT", f"event: {kind} {payload}")
+            if addr != last_action_addr:
+                continue
+            if kind == "pair_result":
                 status_msg = "Paired!" if payload["ok"] else f"Pair failed: {payload.get('error', '?')}"
-            elif kind == "connect_result" and payload.get("address") == last_action_addr:
+            elif kind == "connect_result":
                 status_msg = "Connected!" if payload["ok"] else f"Connect failed: {payload.get('error', '?')}"
                 if payload["ok"]:
+                    log("BT", f"auto-trusting {last_action_addr} after successful connect")
                     bt.trust(last_action_addr)
+            elif kind == "disconnect_result":
+                status_msg = "Disconnected" if payload["ok"] else f"Disconnect failed: {payload.get('error', '?')}"
+            elif kind == "remove_result":
+                status_msg = "Forgotten" if payload["ok"] else f"Remove failed: {payload.get('error', '?')}"
 
-        devices = bt.get_discovered_devices()
+        all_discovered = bt.get_discovered_devices()
+        paired = sorted([d for d in all_discovered if d["paired"]],
+                         key=lambda d: (not d["connected"], d["name"]))
+
+        available = [d for d in all_discovered if not d["paired"]]
         if not show_all:
-            devices = [d for d in devices if _is_named(d)]
-        # Paired devices first, then by signal strength (closer = more likely
-        # to be the thing you're trying to pair right now).
-        devices.sort(key=lambda d: (not d["paired"], -(d["rssi"] or -999)))
+            available = [d for d in available if _is_named(d)]
+        available.sort(key=lambda d: -(d["rssi"] or -999))
 
-        items = [_bt_device_label(d) for d in devices]
+        items = []
+        selectable_devices = []
+
+        items.append((SECTION_MARKER, "PAIRED"))
+        if paired:
+            for d in paired:
+                items.append(_bt_device_label(d))
+                selectable_devices.append(d)
+                items.append((f"  Forget {d['name']}", None))
+                selectable_devices.append(("forget", d["address"]))
+        else:
+            items.append(("No paired devices yet", None))
+            selectable_devices.append(None)
+
+        items.append((SECTION_MARKER,
+                       f"AVAILABLE{'  (scanning…)' if bt.is_scanning() else ''}"))
+        for d in available:
+            items.append(_bt_device_label(d))
+            selectable_devices.append(d)
+
         toggle_label = f"Show all devices: {'ON' if show_all else 'OFF'}"
         items.append((toggle_label, None))
+        selectable_devices.append("toggle_show_all")
+
         rescan_label = "Scanning…" if bt.is_scanning() else "Scan again"
         items.append((rescan_label, None))
+        selectable_devices.append("rescan")
 
-        if selected >= len(items):
-            selected = len(items) - 1
+        selected = max(0, min(selected, len(selectable_devices) - 1))
 
-        if now - last_redraw > 0.2:  # menu doesn't need 1kHz redraws
+        if now - last_redraw > 0.2:
             footer = status_msg or "Hold Prev: back   Play: select"
             img = render_list_screen("Bluetooth", items, selected, footer=footer)
             blit_rect_buf(0, 0, WIDTH, HEIGHT, img.tobytes())
@@ -880,43 +1118,57 @@ def run_bluetooth_screen(bt, buttons):
         clicks, holds, repeats = buttons.poll()
 
         for ev in holds:
-            if ev == "prev":
-                bt.stop_scan()
-                return
-            elif ev == "play_pause":
+            if ev in ("prev", "play_pause"):
+                log("BT", "leaving Bluetooth screen, stopping scan")
                 bt.stop_scan()
                 return
 
         for ev in clicks:
             if ev == "next":
-                selected = min(selected + 1, len(items) - 1)
+                selected = min(selected + 1, len(selectable_devices) - 1)
                 status_msg = None
             elif ev == "prev":
                 selected = max(selected - 1, 0)
                 status_msg = None
             elif ev == "play_pause":
-                if selected == len(devices):          # "Show all" toggle row
+                target = selectable_devices[selected]
+                if target is None:
+                    pass  # "No paired devices yet" placeholder — not actionable
+                elif target == "toggle_show_all":
                     show_all = not show_all
                     selected = 0
-                elif selected == len(devices) + 1:     # "Scan again" row
+                    log("BT", f"show_all toggled -> {show_all}")
+                elif target == "rescan":
+                    log("BT", "manual rescan requested")
                     bt.start_scan()
                     status_msg = "Scanning…"
+                elif isinstance(target, tuple) and target[0] == "forget":
+                    addr = target[1]
+                    last_action_addr = addr
+                    status_msg = "Forgetting…"
+                    log("BT", f"forgetting device {addr}")
+                    bt.remove(addr)
                 else:
-                    dev = devices[selected]
+                    dev = target
                     last_action_addr = dev["address"]
                     if dev["connected"]:
-                        status_msg = "Already connected"
+                        status_msg = "Disconnecting…"
+                        log("BT", f"disconnecting {dev['address']} ({dev['name']})")
+                        bt.disconnect(dev["address"])
                     elif dev["paired"]:
                         status_msg = "Connecting…"
+                        log("BT", f"connecting {dev['address']} ({dev['name']})")
                         bt.connect(dev["address"])
                     else:
                         status_msg = "Pairing…"
+                        log("BT", f"pairing {dev['address']} ({dev['name']})")
                         bt.pair(dev["address"])
 
         time.sleep(0.02)
 
 
-def run_settings_screen(bt, buttons):
+def run_settings_screen(bt, upload_srv, buttons):
+    log("MENU", "entered Settings")
     if bt is not None:
         bt_item = ("Bluetooth", "Pair & connect devices")
     else:
@@ -924,12 +1176,34 @@ def run_settings_screen(bt, buttons):
 
     selected = 0
     last_redraw = 0.0
+    codec_status = get_active_bt_codec()
+    last_codec_check = time.monotonic()
+    log("BT", f"initial codec check: {codec_status}")
 
     while True:
+        # Re-check the active codec periodically rather than on every redraw
+        # (every 0.15s) — this shells out to wpctl, which is cheap but not
+        # free, and the codec essentially never changes mid-session anyway.
+        now_check = time.monotonic()
+        if now_check - last_codec_check > 3.0:
+            new_status = get_active_bt_codec()
+            if new_status != codec_status:
+                log("BT", f"codec status changed: {codec_status} -> {new_status}")
+            codec_status = new_status
+            last_codec_check = now_check
+
+        if upload_srv.is_running():
+            upload_item = ("Upload Server: ON",
+                           f"{upload_srv.get_url_hint()}  pass: {upload_srv.password}")
+        else:
+            upload_item = ("Upload Server: OFF", "Select to enable Wi-Fi music upload")
+
         items = [
             bt_item,
             ("Brightness", f"{backlight.get_brightness()}%  (Vol +/- to adjust)"),
             ("Screen Off", "Tap any button to wake"),
+            ("Audio Codec", f"{codec_status}  (read-only)"),
+            upload_item,
         ]
         selected = max(0, min(selected, len(items) - 1))
 
@@ -943,6 +1217,7 @@ def run_settings_screen(bt, buttons):
         clicks, holds, repeats = buttons.poll()
         for ev in holds:
             if ev in ("prev", "play_pause"):
+                log("MENU", "exiting Settings (hold)")
                 return
 
         # Brightness row: Vol Up/Down adjust live while it's highlighted,
@@ -963,9 +1238,20 @@ def run_settings_screen(bt, buttons):
                 selected = max(selected - 1, 0)
             elif ev == "play_pause":
                 if selected == 0 and bt is not None:
+                    log("MENU", "Settings -> Bluetooth")
                     run_bluetooth_screen(bt, buttons)
+                    log("MENU", "back in Settings (from Bluetooth)")
                 elif selected == 2:
+                    log("MENU", "Settings -> Screen Off")
                     run_screen_off(buttons)
+                    log("MENU", "back in Settings (from Screen Off)")
+                elif selected == 4:
+                    if upload_srv.is_running():
+                        log("UPLOAD", "stopping upload server (user toggle)")
+                        upload_srv.stop()
+                    else:
+                        log("UPLOAD", "starting upload server (user toggle)")
+                        upload_srv.start()
         time.sleep(0.02)
 
 
@@ -974,22 +1260,26 @@ def run_screen_off(buttons):
     The display content underneath is untouched — only the backlight is
     switched off, so waking is instant (no redraw needed, just light again)."""
     prev_brightness = backlight.get_brightness()
+    log("BACKLIGHT", f"screen off requested (was {prev_brightness}%)")
     backlight.fade_to(0, duration_s=0.25)
     try:
         while True:
             clicks, holds, repeats = buttons.poll()
             if clicks or holds:
+                log("BACKLIGHT", f"wake button detected ({(clicks or holds)[0]}), restoring screen")
                 break
             time.sleep(0.05)
     finally:
         backlight.fade_to(prev_brightness, duration_s=0.25)
+        log("BACKLIGHT", f"screen restored to {prev_brightness}%")
 
 
-def run_menu(bt, buttons):
+def run_menu(bt, upload_srv, buttons):
     """
     Top-level menu, entered by holding Play/Pause during playback. Returns
     once the user exits back to Now Playing (Prev hold, or Play/Pause hold).
     """
+    log("MENU", "opened (held Play/Pause)")
     items = [("Settings", "Bluetooth & more")]
     selected = 0
     last_redraw = 0.0
@@ -1005,6 +1295,7 @@ def run_menu(bt, buttons):
         clicks, holds, repeats = buttons.poll()
         for ev in holds:
             if ev in ("prev", "play_pause"):
+                log("MENU", "closed, resuming playback")
                 return
         for ev in clicks:
             if ev == "next":
@@ -1013,11 +1304,80 @@ def run_menu(bt, buttons):
                 selected = max(selected - 1, 0)
             elif ev == "play_pause":
                 if selected == 0:
-                    run_settings_screen(bt, buttons)
+                    log("MENU", "Menu -> Settings")
+                    run_settings_screen(bt, upload_srv, buttons)
+                    log("MENU", "back in Menu (from Settings)")
         time.sleep(0.02)
 
 
-def play_single_track(player, track, buttons=None):
+class ShuffleState:
+    """
+    No-repeat-until-exhausted shuffle. Holds a shuffled permutation of track
+    indices; advancing pops the next one, and once the permutation runs out
+    a fresh one is generated (excluding, where possible, an immediate repeat
+    of the last track played, so the cycle boundary doesn't feel like a
+    skip-and-replay). Also keeps a play history so Prev can step backward
+    through actual shuffle order rather than library order while shuffling.
+    """
+    def __init__(self, num_tracks):
+        self.num_tracks = num_tracks
+        self.active = False
+        self.history = []     # indices played, in actual play order
+        self.hist_pos = -1    # position in history currently playing
+        self._order = []      # remaining shuffled indices for this cycle
+
+    def _reshuffle(self, exclude_index=None):
+        import random
+        order = list(range(self.num_tracks))
+        if exclude_index is not None and exclude_index in order and self.num_tracks > 1:
+            order.remove(exclude_index)
+        random.shuffle(order)
+        self._order = order
+        log("SHUFFLE", f"reshuffled new cycle of {len(order)} tracks "
+                        f"(excluded {exclude_index})")
+
+    def toggle(self, current_index):
+        self.active = not self.active
+        if self.active:
+            self.history = [current_index]
+            self.hist_pos = 0
+            self._reshuffle(exclude_index=current_index)
+        log("SHUFFLE", f"{'ON' if self.active else 'OFF'} (current track index {current_index})")
+        return self.active
+
+    def next_index(self, current_index):
+        """Advance forward: if we're behind the head of history (user went
+        Prev earlier), step forward through history first rather than
+        skipping ahead — same principle as a normal undo/redo stack."""
+        if self.hist_pos < len(self.history) - 1:
+            self.hist_pos += 1
+            return self.history[self.hist_pos]
+
+        if not self._order:
+            # Cycle exhausted: start a fresh one, excluding the track that
+            # just played so the cycle boundary can't immediately repeat it.
+            self._reshuffle(exclude_index=current_index)
+            if not self._order:
+                # Only possible with num_tracks <= 1 — nothing else to play.
+                return current_index
+        nxt = self._order.pop(0)
+        self.history.append(nxt)
+        self.hist_pos = len(self.history) - 1
+        return nxt
+
+    def prev_index(self, current_index):
+        """Step back through actual shuffle history (option C: same 3s-seek
+        rule as non-shuffle Prev, just pointed at shuffle history instead of
+        library order)."""
+        if self.hist_pos > 0:
+            self.hist_pos -= 1
+            return self.history[self.hist_pos]
+        return current_index  # already at the start of this shuffle session
+
+
+def play_single_track(player, track, buttons=None, shuffle=None, current_index=0):
+    log("PLAYBACK", f"loading: {track.get('title', track['file_path'])} "
+                     f"by {track.get('artist', 'Unknown')}")
     if track.get("duration", 0) <= 0:
         meta_dur = get_duration_mutagen(track["file_path"])
         if meta_dur and meta_dur > 0: track["duration"] = meta_dur
@@ -1029,8 +1389,10 @@ def play_single_track(player, track, buttons=None):
     # actually flowing — caps negotiated, Bluetooth A2DP socket open, etc.)
     # rather than assuming readiness after a fixed sleep.
     if not player.wait_until_playing(timeout_s=5.0):
-        print(f"WARNING: pipeline didn't reach PLAYING for {track['file_path']!r} "
-              f"within timeout — continuing anyway, audio may glitch briefly.")
+        log("PLAYBACK", f"WARNING: pipeline didn't reach PLAYING for {track['file_path']!r} "
+                         f"within timeout — continuing anyway, audio may glitch briefly.")
+    else:
+        log("PLAYBACK", "pipeline reached PLAYING, audio flowing")
 
     duration_secs, t0 = 0.0, time.perf_counter()
     while time.perf_counter() - t0 < 1.0:
@@ -1042,9 +1404,12 @@ def play_single_track(player, track, buttons=None):
 
     if duration_secs <= 0: duration_secs = float(track.get("duration", 0.0))
     track["duration"] = duration_secs
+    log("PLAYBACK", f"duration resolved: {duration_secs:.1f}s")
     
     layout = draw_background_and_layout(track)
     layout.update({"vol_visible": False, "vol_last_change": 0.0})
+    if shuffle is not None:
+        update_shuffle_icon(layout, shuffle.active)
 
     last_time_str, last_progress, spool_phase, last_spin, last_pos_poll = None, -1.0, 0, time.perf_counter(), 0.0
     pos_secs, progress, is_playing, action = 0.0, 0.0, True, "ended"
@@ -1082,22 +1447,36 @@ def play_single_track(player, track, buttons=None):
             # guarantees a held press never also appears in `clicks`, so there's
             # no ambiguity between the two gestures on the same button.
             if "play_pause" in holds:
+                log("PLAYBACK", "Play/Pause held -> opening menu")
                 player.pause()
                 is_playing = False
                 return "menu"
+
+            # Hold Next -> toggle shuffle on/off. Distinct gesture from the
+            # menu (Play/Pause hold) and from a normal Next click (handled
+            # below in `clicks`) — ButtonHandler guarantees a held press never
+            # also appears in `clicks`, so there's no ambiguity here either.
+            if "next" in holds and shuffle is not None:
+                shuffle.toggle(current_index)
+                update_shuffle_icon(layout, shuffle.active)
 
             for ev in clicks:
                 if ev == "play_pause":
                     (player.pause() if is_playing else player.play())
                     is_playing = not is_playing
+                    log("PLAYBACK", f"{'paused' if not is_playing else 'resumed'} via click")
                 elif ev == "next":
+                    log("PLAYBACK", "next track requested")
                     player.stop()
                     return "next"
                 elif ev == "prev":
                     if pos_secs < 3.0: 
+                        log("PLAYBACK", "prev track requested")
                         player.stop()
                         return "prev"
-                    else: player.seek_to_start()
+                    else:
+                        log("PLAYBACK", "prev click within track -> seek to start")
+                        player.seek_to_start()
                 elif ev == "vol_up":
                     vol_delta += 0.05
                 elif ev == "vol_down":
@@ -1115,7 +1494,9 @@ def play_single_track(player, track, buttons=None):
                 update_volume_bar(layout, player.get_volume())
 
 
-        if duration_secs > 0 and pos_secs >= duration_secs: break
+        if duration_secs > 0 and pos_secs >= duration_secs:
+            log("PLAYBACK", "track ended naturally")
+            break
         
         # Volume Auto-Hide Cleanup: The new composited magic
         if layout.get("vol_visible") and (time.monotonic() - layout["vol_last_change"] > 1.5):
@@ -1136,7 +1517,10 @@ def play_single_track(player, track, buttons=None):
 def ui_loop():
     tracks = scan_music_folder(MUSIC_ROOT, default_image_path=DEFAULT_ART_PATH)
     if not tracks:
+        log("LIBRARY", f"no tracks found under {MUSIC_ROOT}, falling back to single hardcoded file")
         tracks = [build_track_from_file("/home/rock/Dash Out feat Spiro.mp3", default_image_path=DEFAULT_ART_PATH)]
+    else:
+        log("LIBRARY", f"found {len(tracks)} track(s) under {MUSIC_ROOT}")
 
     player = GstPlayer()
     player.set_volume(0.8)
@@ -1146,38 +1530,77 @@ def ui_loop():
     try:
         bt = BluetoothManager()
         bt.start()
+        log("BT", "BluetoothManager started OK")
     except BluetoothUnavailable as e:
-        print(f"Bluetooth unavailable, Settings > Bluetooth will be disabled: {e}")
+        log("BT", f"unavailable, Settings > Bluetooth will be disabled: {e}")
+
+    upload_srv = MusicUploadServer(MUSIC_ROOT, log_fn=lambda tag, msg: log(tag, msg))
+
+    shuffle = ShuffleState(len(tracks))
 
     index = 0
-    while True:
-        track = tracks[index]
-        result = play_single_track(player, track, buttons)
+    try:
+        while True:
+            track = tracks[index]
+            result = play_single_track(player, track, buttons, shuffle=shuffle, current_index=index)
+            log("PLAYBACK", f"play_single_track returned: {result!r}")
 
-        if result == "menu":
-            if bt is not None:
-                run_menu(bt, buttons)
+            if result == "menu":
+                run_menu(bt, upload_srv, buttons)
+
+                # Rescan if files were uploaded while the menu was open — this is
+                # a safe point to swap the library, since nothing is mid-playback
+                # right now. The currently-playing track is looked up by file
+                # path after rescanning so its index stays correct even if new
+                # files sort earlier in the list (scan_music_folder sorts by
+                # filename), rather than assuming the index is unchanged.
+                if upload_srv.is_rescan_pending():
+                    upload_srv.consume_rescan_flag()
+                    current_path = track["file_path"]
+                    new_tracks = scan_music_folder(MUSIC_ROOT, default_image_path=DEFAULT_ART_PATH)
+                    if new_tracks:
+                        tracks = new_tracks
+                        shuffle = ShuffleState(len(tracks))  # library changed shape; start fresh
+                        try:
+                            index = next(i for i, t in enumerate(tracks) if t["file_path"] == current_path)
+                        except StopIteration:
+                            index = 0  # currently-playing file is gone somehow; just restart from the top
+                        log("LIBRARY", f"rescanned after upload: {len(tracks)} track(s), "
+                                        f"resuming at index {index}")
+
+                # play_single_track already paused before returning "menu"; resume
+                # the same track exactly where it left off rather than advancing.
+                player.play()
+                log("PLAYBACK", "resumed after menu close")
+                continue
+
+            if shuffle.active:
+                index = shuffle.prev_index(index) if result == "prev" else shuffle.next_index(index)
             else:
-                # No Bluetooth backend — still let the menu open (Settings ->
-                # Bluetooth just won't be reachable) rather than stranding the
-                # user with a dead hold gesture and no way back to playback.
-                run_menu(None, buttons)
-            # play_single_track already paused before returning "menu"; resume
-            # the same track exactly where it left off rather than advancing.
-            player.play()
-            continue
+                index = (index - 1) % len(tracks) if result == "prev" else (index + 1) % len(tracks)
+            log("PLAYBACK", f"advancing to track index {index} (shuffle={'on' if shuffle.active else 'off'})")
+    finally:
+        if upload_srv.is_running():
+            upload_srv.stop()
 
-        index = (index - 1) % len(tracks) if result == "prev" else (index + 1) % len(tracks)
 
 def main():
+    log("MAIN", "initializing display")
     ili9488_init()
     write_cmd(0x53); write_data_byte(0x2C)  
     write_cmd(0x51); write_data_byte(0xFF)  
+    log("MAIN", "display initialized, entering ui_loop")
     ui_loop()
 
 if __name__ == "__main__":
-    try: main()
-    except KeyboardInterrupt: pass
+    log("MAIN", "starting up")
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("MAIN", "KeyboardInterrupt received, shutting down")
+    except Exception as e:
+        log("MAIN", f"FATAL: unhandled exception: {e!r}")
+        raise
     finally:
         try: fill_screen_rgb888(0, 0, 0)
         except Exception: pass
@@ -1187,3 +1610,4 @@ if __name__ == "__main__":
         dc_line.release(); rst_line.release()
         btn_play_pause_line.release(); btn_next_line.release(); btn_prev_line.release(); btn_vol_up_line.release(); btn_vol_down_line.release()
         chip.close()
+        log("MAIN", "shutdown complete, GPIO/SPI released")
