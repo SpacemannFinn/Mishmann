@@ -108,7 +108,6 @@ class GstPlayer:
 CHIP_NAME = "gpiochip3"
 DC_LINE = 1       
 RESET_LINE = 8    
-BACKLIGHT_LINE = 10   
 SPI_BUS = 3
 SPI_DEV = 0
 
@@ -176,12 +175,9 @@ def extract_track_theme(pil_img):
 chip = gpiod.Chip(CHIP_NAME)
 dc_line = chip.get_line(DC_LINE)
 rst_line = chip.get_line(RESET_LINE)
-backlight_line = chip.get_line(BACKLIGHT_LINE)
 
 dc_line.request(consumer="ili9488-dc", type=gpiod.LINE_REQ_DIR_OUT)
 rst_line.request(consumer="ili9488-rst", type=gpiod.LINE_REQ_DIR_OUT)
-backlight_line.request(consumer="ili9488-backlight", type=gpiod.LINE_REQ_DIR_OUT)
-backlight_line.set_value(1)
 
 btn_play_pause_line = chip.get_line(PLAY_PAUSE_BTN_LINE)
 btn_next_line       = chip.get_line(NEXT_BTN_LINE)
@@ -194,6 +190,112 @@ btn_next_line.request(consumer="btn-next", type=gpiod.LINE_REQ_DIR_IN)
 btn_prev_line.request(consumer="btn-prev", type=gpiod.LINE_REQ_DIR_IN)
 btn_vol_up_line.request(consumer="btn-volup", type=gpiod.LINE_REQ_DIR_IN)
 btn_vol_down_line.request(consumer="btn-voldown", type=gpiod.LINE_REQ_DIR_IN)
+
+
+# ================================
+# BACKLIGHT — real PWM dimming via PWM9 (pin 18), confirmed working on-device.
+#
+# IMPORTANT, confirmed empirically on this exact hardware: the duty-cycle ->
+# brightness relationship is INVERTED from the usual convention. duty_cycle=0
+# is full bright; duty_cycle=PWM_PERIOD_NS (100%) is black. This class hides
+# that inversion behind set_brightness(0-100) where 0=off and 100=full bright,
+# so nothing else in the codebase needs to know about the inversion.
+#
+# Also confirmed: the response is genuinely smooth across the full range —
+# what looked like a "cliff" in early testing was a bash-loop artifact (big
+# jumps + long holds), not a hardware limitation. A continuous ramp (small
+# steps, short delays) fades cleanly. set_brightness() here writes directly
+# (no ramping) since UI calls already happen at a reasonable cadence from
+# Next/Prev repeats; see fade_to() for an explicit smooth transition helper.
+# ================================
+PWM_CHIP_PATH = "/sys/class/pwm/pwmchip0"
+PWM_CHANNEL = 0
+PWM_PERIOD_NS = 1_000_000   # 1ms period — confirmed working during testing
+
+
+class Backlight:
+    def __init__(self, chip_path=PWM_CHIP_PATH, channel=PWM_CHANNEL,
+                 period_ns=PWM_PERIOD_NS):
+        self.chip_path = chip_path
+        self.channel = channel
+        self.period_ns = period_ns
+        self._pwm_path = f"{chip_path}/pwm{channel}"
+        self._brightness = 100
+        self._available = False
+        self._setup()
+
+    def _write(self, relpath, value):
+        with open(f"{self._pwm_path}/{relpath}", "w") as f:
+            f.write(str(value))
+
+    def _setup(self):
+        try:
+            if not os.path.exists(self._pwm_path):
+                with open(f"{self.chip_path}/export", "w") as f:
+                    f.write(str(self.channel))
+                time.sleep(0.05)  # sysfs needs a moment to create the directory
+            self._write("period", self.period_ns)
+            self._write("duty_cycle", 0)   # 0 duty = full bright (inverted)
+            self._write("enable", 1)
+            self._available = True
+        except Exception as e:
+            print(f"WARNING: backlight PWM unavailable ({e}); "
+                  f"screen will stay at whatever brightness it powered on with.")
+            self._available = False
+
+    def set_brightness(self, percent):
+        """0 = off (screen dark), 100 = full bright. Clamped to [0, 100]."""
+        percent = max(0, min(100, percent))
+        self._brightness = percent
+        if not self._available:
+            return
+        # Inverted relationship, confirmed on this hardware: duty_cycle=0 is
+        # full bright, duty_cycle=period_ns is dark. So brightness% maps to
+        # duty_cycle as (100 - percent)% of the period, not percent directly.
+        duty = int(round((100 - percent) / 100.0 * self.period_ns))
+        try:
+            self._write("duty_cycle", duty)
+        except Exception as e:
+            print(f"WARNING: failed to set backlight brightness: {e}")
+
+    def get_brightness(self):
+        return self._brightness
+
+    def fade_to(self, target_percent, duration_s=0.3, steps=30):
+        """Smooth ramp to a target brightness — confirmed smooth on this
+        hardware when done in small steps rather than one big jump."""
+        if not self._available:
+            self._brightness = max(0, min(100, target_percent))
+            return
+        start = self._brightness
+        target = max(0, min(100, target_percent))
+        if start == target:
+            return
+        delay = duration_s / max(1, steps)
+        for i in range(1, steps + 1):
+            self.set_brightness(start + (target - start) * i / steps)
+            time.sleep(delay)
+
+    def off(self):
+        self.set_brightness(0)
+
+    def on(self, percent=None):
+        self.set_brightness(percent if percent is not None else self._brightness or 100)
+
+    def shutdown(self):
+        """Release the PWM channel cleanly on app exit."""
+        if not self._available:
+            return
+        try:
+            self._write("duty_cycle", 0)  # leave the screen bright, not stuck dark
+            self._write("enable", 0)
+        except Exception:
+            pass
+
+
+backlight = Backlight()
+backlight.set_brightness(100)
+
 
 spi = spidev.SpiDev()
 spi.open(SPI_BUS, SPI_DEV)
@@ -816,16 +918,24 @@ def run_bluetooth_screen(bt, buttons):
 
 def run_settings_screen(bt, buttons):
     if bt is not None:
-        items = [("Bluetooth", "Pair & connect devices")]
+        bt_item = ("Bluetooth", "Pair & connect devices")
     else:
-        items = [("Bluetooth", "Unavailable on this device")]
+        bt_item = ("Bluetooth", "Unavailable on this device")
+
     selected = 0
     last_redraw = 0.0
 
     while True:
+        items = [
+            bt_item,
+            ("Brightness", f"{backlight.get_brightness()}%  (Vol +/- to adjust)"),
+            ("Screen Off", "Tap any button to wake"),
+        ]
+        selected = max(0, min(selected, len(items) - 1))
+
         now = time.monotonic()
-        if now - last_redraw > 0.2:
-            img = render_list_screen("Settings", items, selected,
+        if now - last_redraw > 0.15:  # a touch faster than other menus, since
+            img = render_list_screen("Settings", items, selected,         # brightness updates live while held
                                       footer="Hold Prev: back   Play: select")
             blit_rect_buf(0, 0, WIDTH, HEIGHT, img.tobytes())
             last_redraw = now
@@ -834,6 +944,18 @@ def run_settings_screen(bt, buttons):
         for ev in holds:
             if ev in ("prev", "play_pause"):
                 return
+
+        # Brightness row: Vol Up/Down adjust live while it's highlighted,
+        # instead of needing to drill into a separate screen for one slider.
+        # This intentionally shadows normal volume-changing on this one row
+        # only — every other row in every other screen leaves Vol +/- alone.
+        if selected == 1:
+            for ev in clicks + repeats:
+                if ev == "vol_up":
+                    backlight.set_brightness(backlight.get_brightness() + 5)
+                elif ev == "vol_down":
+                    backlight.set_brightness(backlight.get_brightness() - 5)
+
         for ev in clicks:
             if ev == "next":
                 selected = min(selected + 1, len(items) - 1)
@@ -842,7 +964,25 @@ def run_settings_screen(bt, buttons):
             elif ev == "play_pause":
                 if selected == 0 and bt is not None:
                     run_bluetooth_screen(bt, buttons)
+                elif selected == 2:
+                    run_screen_off(buttons)
         time.sleep(0.02)
+
+
+def run_screen_off(buttons):
+    """Turns the backlight off and waits for any button press to wake it.
+    The display content underneath is untouched — only the backlight is
+    switched off, so waking is instant (no redraw needed, just light again)."""
+    prev_brightness = backlight.get_brightness()
+    backlight.fade_to(0, duration_s=0.25)
+    try:
+        while True:
+            clicks, holds, repeats = buttons.poll()
+            if clicks or holds:
+                break
+            time.sleep(0.05)
+    finally:
+        backlight.fade_to(prev_brightness, duration_s=0.25)
 
 
 def run_menu(bt, buttons):
@@ -1041,9 +1181,9 @@ if __name__ == "__main__":
     finally:
         try: fill_screen_rgb888(0, 0, 0)
         except Exception: pass
-        spi.close(); dc_line.set_value(0); rst_line.set_value(1)
-        try: backlight_line.set_value(0); backlight_line.release()
+        try: backlight.shutdown()
         except Exception: pass
+        spi.close(); dc_line.set_value(0); rst_line.set_value(1)
         dc_line.release(); rst_line.release()
         btn_play_pause_line.release(); btn_next_line.release(); btn_prev_line.release(); btn_vol_up_line.release(); btn_vol_down_line.release()
         chip.close()
