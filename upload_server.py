@@ -18,8 +18,14 @@ import string
 import threading
 import time
 
-ALLOWED_EXTENSIONS = {".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wav"}
+ALLOWED_EXTENSIONS = {".mp3", ".flac", ".m4a", ".aac", ".wav"}
 MAX_UPLOAD_SIZE_BYTES = 500 * 1024 * 1024  # 500MB per request — generous for a whole album
+
+
+class UploadServerUnavailable(Exception):
+    """Raised when Flask/werkzeug aren't installed, or the port can't be
+    bound. Mirrors BluetoothUnavailable's pattern: an optional subsystem
+    failing to start should never take down playback."""
 
 
 def _generate_password(length=6):
@@ -62,7 +68,7 @@ UPLOAD_PAGE_HTML = """
   </style>
 </head>
 <body>
-  <h1>🎵 Add Music to Walkman</h1>
+  <h1>🎵 Add Music to Mishmann</h1>
   <div class="card">
     <form method="post" action="/upload" enctype="multipart/form-data">
       <label>Password</label>
@@ -107,12 +113,29 @@ class MusicUploadServer:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return  # already running, idempotent
+
+            try:
+                app = self._build_app()
+                from werkzeug.serving import make_server
+                server = make_server("0.0.0.0", self.port, app, threaded=True)
+            except ModuleNotFoundError as e:
+                self.log("UPLOAD", f"WARNING: can't start, missing dependency: {e}")
+                raise UploadServerUnavailable(
+                    f"Flask isn't installed. On the device, run: "
+                    f"sudo apt install python3-flask  (original error: {e})"
+                )
+            except OSError as e:
+                # Most commonly "address already in use" — e.g. a previous
+                # process never released the port, or something else is
+                # listening on it already.
+                self.log("UPLOAD", f"WARNING: can't bind port {self.port}: {e}")
+                raise UploadServerUnavailable(
+                    f"Couldn't bind port {self.port} ({e}). "
+                    f"Is something else already using it?"
+                )
+
             self.password = _generate_password()
-            app = self._build_app()
-
-            from werkzeug.serving import make_server
-            self._server = make_server("0.0.0.0", self.port, app, threaded=True)
-
+            self._server = server
             self._thread = threading.Thread(
                 target=self._server.serve_forever, daemon=True, name="upload-server")
             self._thread.start()

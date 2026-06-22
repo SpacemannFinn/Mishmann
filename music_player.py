@@ -17,7 +17,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
 from bt_manager import BluetoothManager, BluetoothUnavailable
-from upload_server import MusicUploadServer
+from upload_server import MusicUploadServer, UploadServerUnavailable
 
 
 # ================================
@@ -1178,6 +1178,7 @@ def run_settings_screen(bt, upload_srv, buttons):
     last_redraw = 0.0
     codec_status = get_active_bt_codec()
     last_codec_check = time.monotonic()
+    upload_error = None
     log("BT", f"initial codec check: {codec_status}")
 
     while True:
@@ -1195,6 +1196,8 @@ def run_settings_screen(bt, upload_srv, buttons):
         if upload_srv.is_running():
             upload_item = ("Upload Server: ON",
                            f"{upload_srv.get_url_hint()}  pass: {upload_srv.password}")
+        elif upload_error:
+            upload_item = ("Upload Server: OFF", upload_error)
         else:
             upload_item = ("Upload Server: OFF", "Select to enable Wi-Fi music upload")
 
@@ -1249,9 +1252,19 @@ def run_settings_screen(bt, upload_srv, buttons):
                     if upload_srv.is_running():
                         log("UPLOAD", "stopping upload server (user toggle)")
                         upload_srv.stop()
+                        upload_error = None
                     else:
                         log("UPLOAD", "starting upload server (user toggle)")
-                        upload_srv.start()
+                        try:
+                            upload_srv.start()
+                            upload_error = None
+                        except UploadServerUnavailable as e:
+                            log("UPLOAD", f"start failed: {e}")
+                            # Keep the message short — the row only has room
+                            # for one line of subtitle text on this screen.
+                            upload_error = "Flask not installed (see log)" \
+                                if "Flask isn't installed" in str(e) \
+                                else "Couldn't start (see log)"
         time.sleep(0.02)
 
 
