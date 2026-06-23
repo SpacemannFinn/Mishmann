@@ -53,7 +53,7 @@ Designed to operate entirely headless on embedded hardware, the player discards 
 ## 📂 System Architecture
 
 The software operates as a cluster of lightweight, decoupled Python threads communicating via D-Bus and NetworkManager signals:
-
+```
                   +--------------------------------+
                   |            boot.py             |
                   |  (Initializes & self-checks)   |
@@ -80,7 +80,7 @@ The software operates as a cluster of lightweight, decoupled Python threads comm
                   +---------------+
                   | genre_fill.py | (MusicBrainz thread)
                   +---------------+
-
+```
 * **`boot.py`**: The system diagnostic manager. Runs prior to playback to verify critical system interfaces. If a critical failure is detected, it draws an on-screen warning and halts execution safely rather than failing silently in the background.
 * **`music_player.py`**: The core runtime. Orchestrates the SPI address windowing, manages PIL in-memory drawings, renders spool rotation phases, and interprets hardware clicks.
 * **`bt_manager.py`**: Native D-Bus driver. Communicates directly with the system `bluetoothd` daemon (mirroring `bluetoothctl`) to register structured, async callbacks for scans, pairings, connections, and device trusts without spawning slow shell subprocesses.
@@ -90,7 +90,7 @@ The software operates as a cluster of lightweight, decoupled Python threads comm
 ## 🛠️ Hardware & Pinout Configuration
 
 This project was built for the **Radxa Zero** utilizing the Linux Kernel GPIO Character Device API (`gpiod`) and `spidev`.
-
+```
     RADXA ZERO 40-PIN HEADER
           +---------+
     3V3   |  1   2  |   5V
@@ -102,4 +102,69 @@ This project was built for the **Radxa Zero** utilizing the Linux Kernel GPIO Ch
     ...   | .   .   |   ...
   * LINE4 | 16  17  |   3V3         * LINE4  = Previous Button
     ...   | .   18  | * LINE10      * LINE10 = Backlight PWM
-  * MOSI  | 19  20  | * LINE20      * MOSI   = SPI
+  * MOSI  | 19  20  | * LINE20      * MOSI   = SPI MOSI / LINE20 = Next Button
+  * LINE8 | 21  22  |   ...         * LINE8  = Reset (RST)
+  * SCLK  | 23  24  | * CS0         * SCLK   = SPI SCLK / CS0 = SPI CS0
+    GND   | 25  26  |   ...
+    ...   | .   .   |   ...
+  * LINE11| 29  30  |   GND         * LINE11 = Volume Up Button
+  * LINE12| 31  32  |   ...         * LINE12 = Volume Down Button
+          +---------+
+```
+### Pinout Table (Radxa Zero GPIO Header)
+
+| **Hardware Component** | **Device Pin / Label** | **Radxa Zero Header Pin** | **Line Number (gpiochip3)** |
+| :--- | :--- | :--- | :--- |
+| **ILI9488 Display** | SPI MOSI | Pin 19 (GPIOC_1) | - (Hardware SPI) |
+| | SPI SCLK | Pin 23 (GPIOC_3) | - (Hardware SPI) |
+| | SPI CS0 | Pin 24 (GPIOC_4) | - (Hardware SPI) |
+| | Data / Command (DC) | Pin 11 (GPIOA_1) | Line 1 |
+| | Reset (RST) | Pin 21 (GPIOA_8) | Line 8 |
+| | Backlight PWM | Pin 18 (GPIOB_10) | Line 10 (PWM Channel 0) |
+| **Tactile Buttons** | Play / Pause | Pin 13 (GPIOA_2) | Line 2 |
+| | Next Track | Pin 38 (GPIOA_20) | Line 20 |
+| | Previous Track | Pin 16 (GPIOA_4) | Line 4 |
+| | Volume Up | Pin 29 (GPIOA_11) | Line 11 |
+| | Volume Down | Pin 31 (GPIOA_12) | Line 12 |
+
+## ⚙️ Installation & Running
+
+### 1. System Dependencies
+
+The player requires GStreamer, GLib, PulseAudio, and several system libraries to connect over D-Bus and claim hardware lines. Install them on your Radxa Zero running Debian/Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install python3-pip python3-dbus python3-gi python3-flask python3-mutagen python3-pil
+sudo apt install gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-pulseaudio
+```
+### 2. Clone the Repository & Configure Permissions
+
+```bash
+git clone [https://github.com/yourusername/mishmann-player.git](https://github.com/yourusername/mishmann-player.git)
+cd mishmann-player
+
+# Create music directory
+mkdir -p /home/rock/music
+```
+*Note: Since the server interacts with NetworkManager via `nmcli` to establish hotspots and connect to networks, make sure the user running the script has appropriate system permissions or sudo privileges.*
+
+### 3. Launching
+
+To start the entire player platform with full diagnostic checks, execute:
+
+```bash
+python3 boot.py
+```
+## 🩺 System Troubleshooting
+
+| **Symptom** | **Root Cause** | **Diagnostic & Resolution** |
+| :--- | :--- | :--- |
+| **Boot hangs at "Display & GPIO: ..."** | SPI Device Node or chip lines locked. | Check if `/dev/spidev3.0` is busy. Run `sudo lsof /dev/spidev*` and kill conflicting python instances. |
+| **Audio fails or plays with static** | PulseAudio output sink misconfigured. | Verify Bluetooth output routing with `pactl list sinks`. Ensure the GStreamer audio-sink property matches your current PulseAudio system sink. |
+| **Wi-Fi Scanning returns empty list** | Single-radio card chip in AP mode. | Single-antenna modules cannot scan and host a hotspot simultaneously. Access the Web GUI and use the **Manual Connection Card** to input the SSID/Password directly. |
+| **D-Bus interface exceptions** | `bluetoothd` service not running. | Run `sudo systemctl status bluetooth`. Verify that the `dbus-python` bindings are successfully imported by launching `python3 -c "import dbus"`. |
+
+## 📄 License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
