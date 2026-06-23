@@ -1,18 +1,6 @@
-"""
-genre_fill.py — fills in missing genre tags via the MusicBrainz API.
-
-Only ever touches tracks whose genre is genuinely unknown (never overwrites
-an existing tag, however messy). Runs as a background thread, gated on real
-WiFi connectivity (checked via upload_server.wifi_get_status), respecting
-MusicBrainz's "no more than 1 request/second" usage policy with a proper
-identifying User-Agent. Results are written back into the actual file tag
-via mutagen -- not just the in-memory dict -- so the lookup is a one-time
-cost per track across the life of the library, and into the in-memory dict
-immediately so the UI can reflect it without a rescan.
-"""
-
 import json
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -27,20 +15,13 @@ except ImportError:
 
 UNKNOWN_GENRE = "Unknown Genre"
 
-# MusicBrainz's usage policy requires a real, identifying User-Agent and a
-# rate limit no faster than 1 request/second for unauthenticated use. This
-# app/contact pair is a placeholder -- MusicBrainz asks that it point to
-# something real (project name + contact), which is worth filling in with
-# an actual email/URL before this runs against the live API long-term.
 USER_AGENT = "MishmannPlayer/1.0 (genre-fill; contact: set-a-real-contact@example.com)"
 MB_BASE_URL = "https://musicbrainz.org/ws/2/recording/"
-MIN_REQUEST_INTERVAL_S = 1.05  # a hair over 1.0 as margin against the limit
+MIN_REQUEST_INTERVAL_S = 1.05
 REQUEST_TIMEOUT_S = 8.0
 
 
 def _mb_request(url):
-    """Single HTTP GET against the MusicBrainz API. Returns parsed JSON
-    dict, or None on any failure. Never raises."""
     req = urllib.request.Request(url, headers={
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
@@ -54,21 +35,34 @@ def _mb_request(url):
         return None
 
 
+def clean_metadata_string(s):
+    """Strips common track noise and Lucene special characters that ruin search match-rates."""
+    if not s:
+        return ""
+    s = str(s)
+    # Strip common parenthetical noise (e.g., "(Remastered 2020)", "[Live Mix]", etc.)
+    s = re.sub(r"\s*[\(\[][^\]\)]*?(remaster|live|edit|bonus|mix|version|feat|ft)[^\]\)]*?[\)\]]", "", s, flags=re.IGNORECASE)
+    # Strip Lucene syntax special operators that break unescaped queries
+    s = re.sub(r'[\+\-\!\(\)\{\}\[\]\^"~\*\?\:\\\/\|\&\;\.]', " ", s)
+    return " ".join(s.split())
+
+
 def lookup_genre(artist, title, log=None):
     """
-    Look up a single recording's genre via MusicBrainz. Tries genres first,
-    falls back to general tags (genres are themselves a kind of tag, and
-    plenty of recordings have tags but no entries specifically promoted to
-    "genre"). Returns a genre string, or None if nothing usable was found.
-    Never raises -- a failed lookup just means this track stays unknown
-    until a future run.
+    Look up a single recording's genre via MusicBrainz. Cleans metadata noise
+    and uses token-group groupings to maximize hit success.
     """
-    if not artist or not title:
+    clean_artist = clean_metadata_string(artist)
+    clean_title = clean_metadata_string(title)
+
+    if not clean_artist or not clean_title:
         return None
 
-    query = f'artist:"{artist}" AND recording:"{title}"'
+    # Use unquoted grouping parenthesis to allow token match flexibility instead of strict phrase matches
+    query = f"artist:({clean_artist}) AND recording:({clean_title})"
     url = (MB_BASE_URL + "?query=" + urllib.parse.quote(query) +
-           "&fmt=json&limit=1&inc=genres+tags")
+           "&fmt=json&limit=3&inc=genres+tags")
+    
     data = _mb_request(url)
     if not data:
         return None
@@ -76,37 +70,29 @@ def lookup_genre(artist, title, log=None):
     recordings = data.get("recordings") or []
     if not recordings:
         return None
-    rec = recordings[0]
 
-    genres = rec.get("genres") or []
-    if genres:
-        best = max(genres, key=lambda g: int(g.get("count", 0) or 0))
-        name = best.get("name")
-        if name:
-            return name.title()
+    # Check top 3 search entries for usable tags
+    for rec in recordings:
+        genres = rec.get("genres") or []
+        if genres:
+            best = max(genres, key=lambda g: int(g.get("count", 0) or 0))
+            name = best.get("name")
+            if name:
+                return name.title()
 
-    tags = rec.get("tags") or []
-    if tags:
-        best = max(tags, key=lambda t: int(t.get("count", 0) or 0))
-        name = best.get("name")
-        if name:
-            return name.title()
+        tags = rec.get("tags") or []
+        if tags:
+            best = max(tags, key=lambda t: int(t.get("count", 0) or 0))
+            name = best.get("name")
+            if name:
+                return name.title()
 
     if log:
-        log("GENRE", f"no genre/tags found for {artist!r} - {title!r}")
+        log("GENRE", f"no genre/tags found for cleansed: {clean_artist!r} - {clean_title!r}")
     return None
 
 
 def write_genre_tag(file_path, genre, log=None):
-    """
-    Writes the genre into the file's actual tag via mutagen (not just the
-    in-memory dict), so this lookup is a one-time cost per track. Handles
-    the case of a file with no existing tag header at all (common on
-    freshly-ripped/converted files) by adding one rather than assuming it's
-    already there. Returns True on success, False on any failure -- never
-    raises, since a tag-write failure shouldn't take down the worker thread
-    or the player.
-    """
     if MutagenFile is None:
         return False
     try:
@@ -119,8 +105,6 @@ def write_genre_tag(file_path, genre, log=None):
         audio.save()
         return True
     except ID3NoHeaderError:
-        # Some formats raise this distinctly rather than just leaving
-        # .tags as None -- handled the same way, just a different path in.
         try:
             audio = MutagenFile(file_path, easy=True)
             audio.add_tags()
@@ -138,15 +122,6 @@ def write_genre_tag(file_path, genre, log=None):
 
 
 class GenreFillWorker:
-    """
-    Background thread that walks a list of track dicts, looks up genre for
-    any still showing UNKNOWN_GENRE, writes it to the file and updates the
-    dict in place, and stops cleanly if WiFi drops mid-run or the player
-    asks it to stop. Designed to be started once WiFi is confirmed
-    connected and left to run at its own (rate-limited, deliberately slow)
-    pace in the background -- never blocks playback or the UI thread.
-    """
-
     def __init__(self, get_wifi_status_fn, log_fn=print):
         self.get_wifi_status = get_wifi_status_fn
         self.log = log_fn
@@ -183,16 +158,13 @@ class GenreFillWorker:
                     return
 
                 if (track.get("genre") or UNKNOWN_GENRE) != UNKNOWN_GENRE:
-                    continue  # never touch a track that already has a real genre
+                    continue
 
                 status = self.get_wifi_status()
                 if not status.get("connected"):
                     self.log("GENRE", "WiFi disconnected, pausing worker")
                     return
 
-                # Respect the rate limit regardless of how long the lookup
-                # itself took -- measure from the start of the previous
-                # request, not just sleep a fixed amount unconditionally.
                 wait = MIN_REQUEST_INTERVAL_S - (time.monotonic() - last_request_at)
                 if wait > 0:
                     time.sleep(wait)
