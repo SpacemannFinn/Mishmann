@@ -481,27 +481,32 @@ class ButtonHandler:
         self.states = {name: {'raw': 1, 'pressed': False, 'start': time.monotonic(), 'long_fired': False, 'repeat': time.monotonic()} for name in self.lines}
 
     def poll(self):
-        clicks, holds, repeats, now = [], [], [], time.monotonic()
+        clicks, holds, repeats = [], [], []
+        now = time.monotonic() # Use a distinct variable for the timestamp
+        
         for name, line in self.lines.items():
             state = self.states[name]
             try: val = line.get_value()
             except OSError: continue
             
             if state['raw'] == 1 and val == 0:
-                state.update({'start': repeats, 'pressed': True, 'long_fired': False, 'repeat': repeats})
+                # Store the timestamp using 'now'
+                state.update({'start': now, 'pressed': True, 'long_fired': False, 'repeat': now})
             elif state['raw'] == 0 and val == 1:
-                if (repeats - state['start']) >= 0.05 and not state['long_fired']: clicks.append(name)
+                # Compare against 'now'
+                if (now - state['start']) >= 0.05 and not state['long_fired']: 
+                    clicks.append(name)
                 state.update({'pressed': False, 'start': 0.0})
             
             if state['pressed'] and val == 0:
-                if (repeats - state['start']) >= 0.5:
+                if (now - state['start']) >= 0.5:
                     if not state['long_fired']:
                         state['long_fired'] = True
                         holds.append(name)
-                        state['repeat'] = repeats
-                    elif repeats - state['repeat'] >= 0.15:
+                        state['repeat'] = now
+                    elif now - state['repeat'] >= 0.15:
                         repeats.append(name)
-                        state['repeat'] = repeats
+                        state['repeat'] = now
             state['raw'] = val
         return clicks, holds, repeats
 
