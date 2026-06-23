@@ -1,6 +1,5 @@
-# 📻 Mishmann Player
+# 📻 Mishmann Player | [![Hippocratic License HL3-FULL](https://img.shields.io/static/v1?label=Hippocratic%20License&message=HL3-FULL&labelColor=5e2751&color=bc8c3d)](https://firstdonoharm.dev/version/3/0/full.html)
 > A premium, tactile digital minimalist music deck designed for single-board computers (specifically the **Radxa Zero**), utilizing an ILI9488 $480 \times 320$ IPS SPI display and a highly physical, five-button interface.
-[![Hippocratic License HL3-FULL](https://img.shields.io/static/v1?label=Hippocratic%20License&message=HL3-FULL&labelColor=5e2751&color=bc8c3d)](https://firstdonoharm.dev/version/3/0/full.html)
 
 ## 📖 Project Overview
 
