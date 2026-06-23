@@ -34,29 +34,60 @@ import music_player as mp
 # SPLASH / LOGO
 # ================================
 def draw_splash():
-    """Simple centered wordmark -- deliberately plain rather than a bitmap
-    logo asset, so boot.py has zero extra files to ship or go missing."""
+    """
+    Mishmann wordmark over a static pair of spools linked by a tape line --
+    the same motif used on the real Now Playing screen (SpoolAnimator),
+    rather than a generic centered-text title card. Uses the project's
+    actual palette constants (MENU_BG/MENU_TEXT/MENU_SUBTEXT/MENU_ACCENT)
+    so this screen reads as the same product, not a placeholder bolted on.
+    """
     from PIL import Image, ImageDraw, ImageFont
-    img = Image.new("RGB", (mp.WIDTH, mp.HEIGHT), (16, 16, 20))
+    img = Image.new("RGB", (mp.WIDTH, mp.HEIGHT), mp.MENU_BG)
     draw = ImageDraw.Draw(img)
     try:
         title_font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 34)
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 26)
         sub_font = ImageFont.truetype(
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
     except Exception:
         title_font = sub_font = ImageFont.load_default()
 
-    title = "WALKMAN"
+    title = "MISHMANN"
     tw = draw.textlength(title, font=title_font)
-    draw.text(((mp.WIDTH - tw) / 2, mp.HEIGHT / 2 - 40), title,
-               font=title_font, fill=(245, 245, 248))
-    draw.rectangle([mp.WIDTH / 2 - 30, mp.HEIGHT / 2 + 4,
-                    mp.WIDTH / 2 + 30, mp.HEIGHT / 2 + 7], fill=(232, 106, 38))
+    title_y = mp.HEIGHT * 0.28
+    draw.text(((mp.WIDTH - tw) / 2, title_y), title,
+               font=title_font, fill=mp.MENU_TEXT)
+    underline_w = 40
+    draw.rectangle([(mp.WIDTH - underline_w) / 2, title_y + 38,
+                    (mp.WIDTH + underline_w) / 2, title_y + 41], fill=mp.MENU_ACCENT)
+
+    # Static spool pair + tape line -- same geometry/proportions as the real
+    # Now Playing screen's SpoolAnimator (48px spools, accent-colored line),
+    # just drawn once rather than driven by playback phase.
+    spool_size = 48
+    spool_y = title_y + 70
+    gap = 76
+    spool1_x = mp.WIDTH / 2 - gap / 2 - spool_size / 2
+    spool2_x = mp.WIDTH / 2 + gap / 2 - spool_size / 2
+
+    tape_y = spool_y + spool_size / 2
+    draw.line([(spool1_x + spool_size, tape_y), (spool2_x, tape_y)],
+               fill=mp.MENU_ACCENT, width=2)
+
+    for sx in (spool1_x, spool2_x):
+        cx, cy, r = sx + spool_size / 2, spool_y + spool_size / 2, spool_size / 2 - 2
+        draw.ellipse([sx + 2, spool_y + 2, sx + spool_size - 3, spool_y + spool_size - 3],
+                     outline=mp.MENU_ACCENT, width=2)
+        inner_r = spool_size * 0.12
+        draw.ellipse([cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r], fill=mp.MENU_ACCENT)
+        hole_r = spool_size * 0.04
+        draw.ellipse([cx - hole_r, cy - hole_r, cx + hole_r, cy + hole_r], fill=mp.MENU_BG)
+
     sub = "starting up…"
     sw = draw.textlength(sub, font=sub_font)
-    draw.text(((mp.WIDTH - sw) / 2, mp.HEIGHT / 2 + 20), sub,
-               font=sub_font, fill=(150, 155, 165))
+    sub_y = spool_y + spool_size + 24
+    draw.text(((mp.WIDTH - sw) / 2, sub_y), sub,
+               font=sub_font, fill=mp.MENU_SUBTEXT)
     mp.blit_rect_buf(0, 0, mp.WIDTH, mp.HEIGHT, img.tobytes())
 
 
@@ -71,7 +102,7 @@ def draw_checks_screen(results, in_progress_label=None):
     to diff/partial-update for a screen that's shown for a couple seconds.
     """
     from PIL import Image, ImageDraw, ImageFont
-    img = Image.new("RGB", (mp.WIDTH, mp.HEIGHT), (16, 16, 20))
+    img = Image.new("RGB", (mp.WIDTH, mp.HEIGHT), mp.MENU_BG)
     draw = ImageDraw.Draw(img)
     try:
         title_font = ImageFont.truetype(
@@ -81,50 +112,55 @@ def draw_checks_screen(results, in_progress_label=None):
     except Exception:
         title_font = row_font = ImageFont.load_default()
 
-    draw.text((20, 14), "Checking systems…", font=title_font, fill=(245, 245, 248))
+    # Same header treatment as every other screen (render_list_screen etc):
+    # title + thin divider + short accent underline tab, not a bespoke style.
+    draw.text((20, 14), "Checking systems…", font=title_font, fill=mp.MENU_TEXT)
     draw.rectangle([0, 48, mp.WIDTH, 49], fill=(50, 50, 58))
+    draw.rectangle([20, 45, 60, 47], fill=mp.MENU_ACCENT)
 
     y = 64
-    for label, status in results:
+    ok_color = (120, 210, 130)    # kept distinct from MENU_ACCENT (orange) --
+    fail_color = (220, 90, 90)    # status needs its own green/red language,
+    for label, status in results:                              # not the brand accent
         if status is True:
-            mark, color = "OK", (120, 210, 130)
+            mark, color = "OK", ok_color
         elif status is False:
-            mark, color = "FAIL", (220, 90, 90)
+            mark, color = "FAIL", fail_color
         else:
-            mark, color = "…", (150, 155, 165)
-        draw.text((20, y), label, font=row_font, fill=(220, 220, 225))
+            mark, color = "…", mp.MENU_SUBTEXT
+        draw.text((20, y), label, font=row_font, fill=mp.MENU_TEXT)
         mark_w = draw.textlength(mark, font=row_font)
         draw.text((mp.WIDTH - 24 - mark_w, y), mark, font=row_font, fill=color)
         y += 26
 
     if in_progress_label:
-        draw.text((20, mp.HEIGHT - 28), in_progress_label, font=row_font, fill=(150, 155, 165))
+        draw.text((20, mp.HEIGHT - 28), in_progress_label, font=row_font, fill=mp.MENU_SUBTEXT)
 
     mp.blit_rect_buf(0, 0, mp.WIDTH, mp.HEIGHT, img.tobytes())
 
 
 def draw_fatal_screen(failed_label, detail):
     from PIL import Image, ImageDraw, ImageFont
-    img = Image.new("RGB", (mp.WIDTH, mp.HEIGHT), (30, 16, 16))
-    draw = ImageDraw.Draw(img)
-    try:
+    img = Image.new("RGB", (mp.WIDTH, mp.HEIGHT), (30, 16, 16))  # deliberately distinct from
+    draw = ImageDraw.Draw(img)                                   # MENU_BG -- this is a real
+    try:                                                          # alarm state, not a menu
         title_font = ImageFont.truetype(
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
         row_font = ImageFont.truetype(
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
     except Exception:
         title_font = row_font = ImageFont.load_default()
-    draw.text((20, 20), "Startup failed", font=title_font, fill=(245, 245, 248))
+    draw.text((20, 20), "Startup failed", font=title_font, fill=mp.MENU_TEXT)
     draw.text((20, 56), failed_label, font=row_font, fill=(230, 130, 130))
     # Wrap the detail text crudely so it doesn't run off-screen.
     max_chars = 48
     lines = [detail[i:i + max_chars] for i in range(0, len(detail), max_chars)][:8]
     y = 84
     for line in lines:
-        draw.text((20, y), line, font=row_font, fill=(190, 190, 195))
+        draw.text((20, y), line, font=row_font, fill=mp.MENU_SUBTEXT)
         y += 20
     draw.text((20, mp.HEIGHT - 28), "Check the log for details. Power-cycle to retry.",
-               font=row_font, fill=(150, 155, 165))
+               font=row_font, fill=mp.MENU_SUBTEXT)
     mp.blit_rect_buf(0, 0, mp.WIDTH, mp.HEIGHT, img.tobytes())
 
 

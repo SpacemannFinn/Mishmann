@@ -22,6 +22,7 @@ from upload_server import (
     wifi_start_hotspot, wifi_stop_hotspot, wifi_is_hotspot_active,
     HOTSPOT_SSID, HOTSPOT_PASSWORD, HOTSPOT_GATEWAY_IP,
 )
+from genre_fill import GenreFillWorker
 
 
 # ================================
@@ -1217,7 +1218,7 @@ def _group_tracks(tracks):
         by_artist.setdefault(artist, {}).setdefault(album, []).append((i, t))
     return by_artist
 
-def run_library_screen(tracks, buttons, bt=None, upload_srv=None):
+def run_library_screen(tracks, buttons, bt=None, upload_srv=None, genre_worker=None):
     """
     Browse Artist -> Album -> Track using the Concept 2 Split View.
     Returns the chosen track's global index, or None if the user backed out
@@ -1290,7 +1291,7 @@ def run_library_screen(tracks, buttons, bt=None, upload_srv=None):
             if ev == "play_pause":
                 if bt is not None or upload_srv is not None:
                     log("MENU", "Library -> Settings (hold Play)")
-                    run_settings_screen(bt, upload_srv, buttons)
+                    run_settings_screen(bt, upload_srv, buttons, genre_worker)
                     log("MENU", "back in Library (from Settings)")
                     last_redraw = 0.0
                 else:
@@ -1331,7 +1332,7 @@ def run_library_screen(tracks, buttons, bt=None, upload_srv=None):
         time.sleep(0.02)
 
 
-def run_settings_screen(bt, upload_srv, buttons):
+def run_settings_screen(bt, upload_srv, buttons, genre_worker=None):
     log("MENU", "entered Settings")
     if bt is not None:
         bt_item = ("Bluetooth", "Pair & connect devices")
@@ -1379,6 +1380,19 @@ def run_settings_screen(bt, upload_srv, buttons):
         else:
             wifi_sub = "Not connected"
 
+        if genre_worker is None:
+            genre_item = None
+        elif genre_worker.is_running:
+            genre_item = ("Genre Tagging: Running",
+                          f"Checked {genre_worker.tracks_checked}, "
+                          f"filled {genre_worker.tracks_filled}")
+        elif genre_worker.tracks_checked > 0:
+            genre_item = ("Genre Tagging: Idle",
+                          f"Last run: checked {genre_worker.tracks_checked}, "
+                          f"filled {genre_worker.tracks_filled}")
+        else:
+            genre_item = ("Genre Tagging: Idle", "Runs automatically when Wi-Fi connects")
+
         items = [
             bt_item,
             ("Brightness", f"{backlight.get_brightness()}%  (Vol +/- to adjust)"),
@@ -1387,6 +1401,8 @@ def run_settings_screen(bt, upload_srv, buttons):
             upload_item,
             ("Wi-Fi", wifi_sub),
         ]
+        if genre_item is not None:
+            items.append(genre_item)
         selected = max(0, min(selected, len(items) - 1))
 
         now = time.monotonic()
@@ -1458,7 +1474,7 @@ def run_screen_off(buttons):
         log("BACKLIGHT", f"screen restored to {prev_brightness}%")
 
 
-def run_menu(bt, upload_srv, tracks, buttons):
+def run_menu(bt, upload_srv, tracks, buttons, genre_worker=None):
     log("MENU", "opened (held Play/Pause)")
     items = [("Library", "Browse by artist"), ("Settings", "Bluetooth & more")]
     selected = 0
@@ -1485,13 +1501,13 @@ def run_menu(bt, upload_srv, tracks, buttons):
             elif ev == "play_pause":
                 if selected == 0:
                     log("MENU", "Menu -> Library")
-                    chosen = run_library_screen(tracks, buttons, bt, upload_srv)
+                    chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
                     if chosen is not None:
                         return chosen
                     log("MENU", "back in Menu (from Library)")
                 elif selected == 1:
                     log("MENU", "Menu -> Settings")
-                    run_settings_screen(bt, upload_srv, buttons)
+                    run_settings_screen(bt, upload_srv, buttons, genre_worker)
                     log("MENU", "back in Menu (from Settings)")
         time.sleep(0.02)
 
@@ -1909,6 +1925,10 @@ def ui_loop():
         else:
             log("WIFI", "hotspot failed to start, continuing without WiFi setup screen")
 
+    genre_worker = GenreFillWorker(wifi_get_status, log_fn=log)
+    if wifi_get_status()["connected"]:
+        genre_worker.start(tracks)
+
     shuffle = ShuffleState(len(tracks))
 
     def rescan_if_needed(currently_playing_path):
@@ -1933,12 +1953,12 @@ def ui_loop():
 
     try:
         log("LIBRARY", "boot: opening Library as the home screen")
-        chosen = run_library_screen(tracks, buttons, bt, upload_srv)
+        chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
         rescanned_idx = rescan_if_needed(None)
         if rescanned_idx is not None and chosen is None:
             chosen = rescanned_idx
         while chosen is None:
-            chosen = run_library_screen(tracks, buttons, bt, upload_srv)
+            chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
         index = chosen
 
         while True:
@@ -1948,14 +1968,30 @@ def ui_loop():
 
             if result in ("menu", "library"):
                 if result == "menu":
-                    chosen = run_menu(bt, upload_srv, tracks, buttons)
+                    chosen = run_menu(bt, upload_srv, tracks, buttons, genre_worker)
                 else:
-                    chosen = run_library_screen(tracks, buttons, bt, upload_srv)
+                    chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
                 chosen_path = tracks[chosen]["file_path"] if chosen is not None else None
 
                 rescanned_idx = rescan_if_needed(track["file_path"])
                 if rescanned_idx is not None and chosen_path is None:
                     index = rescanned_idx
+
+                # WiFi may have connected since boot (e.g. via the setup
+                # flow, or Settings > Wi-Fi) -- start() is a no-op if the
+                # worker's already running, so this is safe to call here
+                # on every Menu/Library round-trip rather than needing to
+                # thread genre_worker through every settings screen.
+                if rescanned_idx is not None and genre_worker.is_running:
+                    # The library just changed shape (upload landed) -- the
+                    # running worker is still holding the OLD track list
+                    # and start() is a no-op while running, so newly
+                    # uploaded tracks would otherwise never get checked.
+                    # Restart against the fresh list.
+                    genre_worker.stop()
+                    genre_worker.start(tracks)
+                elif not genre_worker.is_running and wifi_get_status()["connected"]:
+                    genre_worker.start(tracks)
 
                 if chosen_path is not None:
                     try:
@@ -1978,6 +2014,8 @@ def ui_loop():
     finally:
         if upload_srv.is_running():
             upload_srv.stop()
+        if genre_worker.is_running:
+            genre_worker.stop()
 
 
 def main():
