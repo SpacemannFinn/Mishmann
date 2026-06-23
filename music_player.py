@@ -191,28 +191,63 @@ def extract_track_theme(pil_img):
 
 # ================================
 # GPIO & SPI SETUP
+# Deferred: nothing here runs at import time anymore. boot.py (or anything
+# else driving startup) calls init_hardware() explicitly, once, after
+# whatever pre-flight checks it wants to run -- e.g. confirming the SPI
+# device node exists before we try to open it, rather than finding out via
+# an unhandled exception mid-import.
 # ================================
-chip = gpiod.Chip(CHIP_NAME)
-dc_line = chip.get_line(DC_LINE)
-rst_line = chip.get_line(RESET_LINE)
+chip = None
+dc_line = rst_line = None
+btn_play_pause_line = btn_next_line = btn_prev_line = btn_vol_up_line = btn_vol_down_line = None
+backlight = None
+spi = None
+_HAS_WRITEBYTES2 = False
 
-dc_line.request(consumer="ili9488-dc", type=gpiod.LINE_REQ_DIR_OUT)
-rst_line.request(consumer="ili9488-rst", type=gpiod.LINE_REQ_DIR_OUT)
 
-btn_play_pause_line = chip.get_line(PLAY_PAUSE_BTN_LINE)
-btn_next_line       = chip.get_line(NEXT_BTN_LINE)
-btn_prev_line       = chip.get_line(PREV_BTN_LINE)
-btn_vol_up_line     = chip.get_line(VOL_UP_BTN_LINE)
-btn_vol_down_line   = chip.get_line(VOL_DOWN_BTN_LINE)
+def init_hardware():
+    """
+    Claims GPIO lines, starts the backlight PWM, and opens the SPI bus.
+    Safe to call exactly once per process. Raises on failure rather than
+    silently leaving things half-initialized -- callers (boot.py) should
+    catch and report, not assume success.
+    """
+    global chip, dc_line, rst_line
+    global btn_play_pause_line, btn_next_line, btn_prev_line, btn_vol_up_line, btn_vol_down_line
+    global backlight, spi, _HAS_WRITEBYTES2
 
-btn_play_pause_line.request(consumer="btn-play", type=gpiod.LINE_REQ_DIR_IN)
-btn_next_line.request(consumer="btn-next", type=gpiod.LINE_REQ_DIR_IN)
-btn_prev_line.request(consumer="btn-prev", type=gpiod.LINE_REQ_DIR_IN)
-btn_vol_up_line.request(consumer="btn-volup", type=gpiod.LINE_REQ_DIR_IN)
-btn_vol_down_line.request(consumer="btn-voldown", type=gpiod.LINE_REQ_DIR_IN)
-log("GPIO", f"chip={CHIP_NAME} dc={DC_LINE} rst={RESET_LINE} "
-            f"buttons=(play={PLAY_PAUSE_BTN_LINE},next={NEXT_BTN_LINE},"
-            f"prev={PREV_BTN_LINE},vol_up={VOL_UP_BTN_LINE},vol_down={VOL_DOWN_BTN_LINE}) requested OK")
+    chip = gpiod.Chip(CHIP_NAME)
+    dc_line = chip.get_line(DC_LINE)
+    rst_line = chip.get_line(RESET_LINE)
+
+    dc_line.request(consumer="ili9488-dc", type=gpiod.LINE_REQ_DIR_OUT)
+    rst_line.request(consumer="ili9488-rst", type=gpiod.LINE_REQ_DIR_OUT)
+
+    btn_play_pause_line = chip.get_line(PLAY_PAUSE_BTN_LINE)
+    btn_next_line       = chip.get_line(NEXT_BTN_LINE)
+    btn_prev_line       = chip.get_line(PREV_BTN_LINE)
+    btn_vol_up_line     = chip.get_line(VOL_UP_BTN_LINE)
+    btn_vol_down_line   = chip.get_line(VOL_DOWN_BTN_LINE)
+
+    btn_play_pause_line.request(consumer="btn-play", type=gpiod.LINE_REQ_DIR_IN)
+    btn_next_line.request(consumer="btn-next", type=gpiod.LINE_REQ_DIR_IN)
+    btn_prev_line.request(consumer="btn-prev", type=gpiod.LINE_REQ_DIR_IN)
+    btn_vol_up_line.request(consumer="btn-volup", type=gpiod.LINE_REQ_DIR_IN)
+    btn_vol_down_line.request(consumer="btn-voldown", type=gpiod.LINE_REQ_DIR_IN)
+    log("GPIO", f"chip={CHIP_NAME} dc={DC_LINE} rst={RESET_LINE} "
+                f"buttons=(play={PLAY_PAUSE_BTN_LINE},next={NEXT_BTN_LINE},"
+                f"prev={PREV_BTN_LINE},vol_up={VOL_UP_BTN_LINE},vol_down={VOL_DOWN_BTN_LINE}) requested OK")
+
+    backlight = Backlight()
+    backlight.set_brightness(100)
+
+    spi = spidev.SpiDev()
+    spi.open(SPI_BUS, SPI_DEV)
+    spi.max_speed_hz = 60_000_000
+    spi.mode = 0
+    _HAS_WRITEBYTES2 = hasattr(spi, "writebytes2")
+
+
 
 
 # ================================
@@ -300,15 +335,6 @@ class Backlight:
         except Exception as e:
             log("BACKLIGHT", f"WARNING: shutdown cleanup failed: {e}")
 
-backlight = Backlight()
-backlight.set_brightness(100)
-
-
-spi = spidev.SpiDev()
-spi.open(SPI_BUS, SPI_DEV)
-spi.max_speed_hz = 60_000_000
-spi.mode = 0
-
 def dc_command(): dc_line.set_value(0)
 def dc_data(): dc_line.set_value(1)
 
@@ -330,7 +356,6 @@ def hardware_reset():
     rst_line.set_value(1)
     time.sleep(0.15)
 
-_HAS_WRITEBYTES2 = hasattr(spi, "writebytes2")
 def spi_write_bulk(buf):
     if _HAS_WRITEBYTES2: spi.writebytes2(buf)
     else:
@@ -1956,6 +1981,8 @@ def ui_loop():
 
 
 def main():
+    log("MAIN", "initializing hardware")
+    init_hardware()
     log("MAIN", "initializing display")
     ili9488_init()
     write_cmd(0x53); write_data_byte(0x2C)  
