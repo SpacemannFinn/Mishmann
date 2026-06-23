@@ -25,7 +25,7 @@ except ImportError:
 
 UNKNOWN_GENRE = "Unknown Genre"
 
-USER_AGENT = "MishmannPlayer/1.0 (genre-fill; contact: set-a-real-contact@example.com)"
+USER_AGENT = "MishmannPlayer/1.0 (genre-fill; contact: 3123yes@gmail.com)"
 MB_BASE_URL = "https://musicbrainz.org/ws/2/recording/"
 MIN_REQUEST_INTERVAL_S = 1.05
 REQUEST_TIMEOUT_S = 8.0
