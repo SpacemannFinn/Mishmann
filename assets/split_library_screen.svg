@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 320" width="100%" height="100%">
+  <defs>
+    <linearGradient id="art1-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#a855f7" />
+      <stop offset="100%" stop-color="#ec4899" />
+    </linearGradient>
+    <linearGradient id="art2-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0284c7" />
+      <stop offset="100%" stop-color="#38bdf8" />
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="8" dy="8" stdDeviation="6" flood-color="#000" flood-opacity="0.45" />
+    </filter>
+  </defs>
+
+  <!-- Background Base -->
+  <rect width="480" height="320" fill="#18181e" />
+
+  <!-- LEFT PANE (Menu List) -->
+  <rect width="240" height="320" fill="#18181e" />
+  <rect width="240" height="40" fill="#1e1b29" />
+  <text x="16" y="26" font-family="'DejaVu Sans', sans-serif" font-size="16px" font-weight="bold" fill="#f0f0f5">Artists</text>
+  <line x1="0" y1="40" x2="240" y2="40" stroke="#32323a" stroke-width="1" />
+
+  <!-- List Rows -->
+  <text x="16" y="74" font-family="'DejaVu Sans', sans-serif" font-size="16px" fill="#cbd5e1">Gunship</text>
+  
+  <!-- Highlighted Row -->
+  <rect x="0" y="94" width="240" height="44" fill="#f97316" />
+  <text x="16" y="121" font-family="'DejaVu Sans', sans-serif" font-size="16px" font-weight="bold" fill="#ffffff">The Midnight</text>
+
+  <text x="16" y="170" font-family="'DejaVu Sans', sans-serif" font-size="16px" fill="#cbd5e1">HOME</text>
+  <text x="16" y="214" font-family="'DejaVu Sans', sans-serif" font-size="16px" fill="#cbd5e1">Perturbator</text>
+  <text x="16" y="258" font-family="'DejaVu Sans', sans-serif" font-size="16px" fill="#cbd5e1">Jan Hammer</text>
+
+  <!-- Vertical Pane Divider -->
+  <line x1="240" y1="0" x2="240" y2="320" stroke="#32323a" stroke-width="1" />
+
+  <!-- RIGHT PANE (Deck Preview) -->
+  <rect x="241" width="239" height="320" fill="#082f49" />
+
+  <!-- Amalgam 2-Album Split Collage with Drop Shadow -->
+  <g filter="url(#shadow)">
+    <!-- Shadow & Border box -->
+    <rect x="288" y="38" width="144" height="144" fill="#0f0f14" rx="2" />
+    
+    <!-- Left Art Slice -->
+    <g transform="translate(290, 40)">
+      <rect width="70" height="140" fill="url(#art1-grad)" />
+      <!-- Left decorative cassette loop inside left crop -->
+      <circle cx="50" cy="70" r="20" fill="none" stroke="#ffffff" stroke-width="1" stroke-opacity="0.1" />
+    </g>
+    <!-- Right Art Slice -->
+    <g transform="translate(360, 40)">
+      <rect width="70" height="140" fill="url(#art2-grad)" />
+      <!-- Right decorative cassette loop inside right crop -->
+      <circle cx="20" cy="70" r="20" fill="none" stroke="#ffffff" stroke-width="1" stroke-opacity="0.1" />
+    </g>
+    <!-- Dark vertical segment divider -->
+    <line x1="360" y1="40" x2="360" y2="180" stroke="#0f0f14" stroke-width="2" />
+  </g>
+
+  <!-- Metadata Overlay -->
+  <text x="360" y="215" font-family="'DejaVu Sans', sans-serif" font-size="18px" font-weight="bold" fill="#ffffff" text-anchor="middle">The Midnight</text>
+  <text x="360" y="238" font-family="'DejaVu Sans', sans-serif" font-size="14px" fill="#969ba5" text-anchor="middle">2 Album(s)</text>
+  <text x="360" y="292" font-family="'DejaVu Sans Mono', monospace" font-size="12px" font-weight="bold" fill="#f97316" text-anchor="middle">SYNTHWAVE</text>
+</svg>

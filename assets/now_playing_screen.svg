@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 320" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#121026" />
+      <stop offset="100%" stop-color="#070610" />
+    </linearGradient>
+    <linearGradient id="art-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ec4899" />
+      <stop offset="100%" stop-color="#f97316" />
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="8" dy="8" stdDeviation="6" flood-color="#000" flood-opacity="0.6" />
+    </filter>
+  </defs>
+  
+  <rect width="480" height="320" fill="url(#bg-grad)" />
+
+  <!-- Album Art with Border and Drop Shadow -->
+  <g filter="url(#shadow)">
+    <!-- Border Box -->
+    <rect x="158" y="23" width="164" height="164" fill="#0f0f14" rx="2" />
+    <!-- Artwork -->
+    <rect x="160" y="25" width="160" height="160" fill="url(#art-grad)" rx="1" />
+  </g>
+
+  <!-- Minimal Decorative Cassette Lines inside Art -->
+  <circle cx="240" cy="105" r="30" fill="none" stroke="#ffffff" stroke-width="1.5" stroke-opacity="0.15" />
+  <line x1="190" y1="105" x2="290" y2="105" stroke="#ffffff" stroke-width="1.5" stroke-opacity="0.15" />
+
+  <!-- Shuffle Icon (Active) -->
+  <g transform="translate(438, 16)">
+    <!-- Path 1 -->
+    <path d="M2,6 C5,6 7,16 10,16 L14,16" fill="none" stroke="#f97316" stroke-width="2" stroke-linecap="round" />
+    <!-- Path 2 -->
+    <path d="M2,16 C5,16 7,6 10,6 L14,6" fill="none" stroke="#f97316" stroke-width="2" stroke-linecap="round" />
+    <!-- Arrow 1 -->
+    <polygon points="14,13 20,16 14,19" fill="#f97316" />
+    <!-- Arrow 2 -->
+    <polygon points="14,3 20,6 14,9" fill="#f97316" />
+  </g>
+
+  <!-- Tape Mechanism -->
+  <!-- Tape Path Connecting Spools -->
+  <line x1="204" y1="233" x2="276" y2="233" stroke="#f97316" stroke-width="2" stroke-opacity="0.5" />
+  
+  <!-- Left Spool -->
+  <g transform="translate(156, 210)">
+    <circle cx="24" cy="24" r="22" fill="none" stroke="#f97316" stroke-width="2" />
+    <!-- Rotating Mechanical Bar -->
+    <line x1="4" y1="12" x2="44" y2="36" stroke="#f97316" stroke-width="2" />
+    <!-- Center Dot -->
+    <circle cx="24" cy="24" r="5.7" fill="#f97316" />
+    <!-- Spindle Hole -->
+    <circle cx="24" cy="24" r="1.9" fill="#121026" />
+  </g>
+
+  <!-- Right Spool -->
+  <g transform="translate(228, 210)">
+    <circle cx="24" cy="24" r="22" fill="none" stroke="#f97316" stroke-width="2" />
+    <!-- Rotating Mechanical Bar -->
+    <line x1="4" y1="12" x2="44" y2="36" stroke="#f97316" stroke-width="2" />
+    <!-- Center Dot -->
+    <circle cx="24" cy="24" r="5.7" fill="#f97316" />
+    <!-- Spindle Hole -->
+    <circle cx="24" cy="24" r="1.9" fill="#121026" />
+  </g>
+
+  <!-- Track Info -->
+  <text x="20" y="280" font-family="'DejaVu Sans', sans-serif" font-size="20px" font-weight="bold" fill="#f0f0f5">Oxygène</text>
+  <text x="20" y="302" font-family="'DejaVu Sans', sans-serif" font-size="16px" fill="#969ba5">Jean-Michel Jarre</text>
+
+  <!-- Time Counter -->
+  <text x="460" y="300" font-family="'DejaVu Sans Mono', monospace" font-size="24px" font-weight="bold" fill="#f97316" text-anchor="end">01:24</text>
+</svg>
