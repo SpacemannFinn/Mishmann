@@ -36,21 +36,21 @@ def _mb_request(url):
 
 
 def clean_metadata_string(s):
-    """Strips common track noise and Lucene special characters that ruin search match-rates."""
+    """Strips common track noise, commas, and Lucene special characters that ruin search match-rates."""
     if not s:
         return ""
     s = str(s)
-    # Strip common parenthetical noise (e.g., "(Remastered 2020)", "[Live Mix]", etc.)
+    # Strip common parenthetical noise (e.g., "(Remastered 2020)", "[Live Mix]", etc.)[cite: 3]
     s = re.sub(r"\s*[\(\[][^\]\)]*?(remaster|live|edit|bonus|mix|version|feat|ft)[^\]\)]*?[\)\]]", "", s, flags=re.IGNORECASE)
-    # Strip Lucene syntax special operators that break unescaped queries
-    s = re.sub(r'[\+\-\!\(\)\{\}\[\]\^"~\*\?\:\\\/\|\&\;\.]', " ", s)
+    # Added ',' to the character strip block to prevent Lucene syntax breakage[cite: 3]
+    s = re.sub(r'[\+\-\!\(\)\{\}\[\]\^"~\*\?\:\\\/\|\&\;\.\,]', " ", s)
     return " ".join(s.split())
 
 
 def lookup_genre(artist, title, log=None):
     """
     Look up a single recording's genre via MusicBrainz. Cleans metadata noise
-    and uses token-group groupings to maximize hit success.
+    and uses precise phrase-quoted parameters.[cite: 3]
     """
     clean_artist = clean_metadata_string(artist)
     clean_title = clean_metadata_string(title)
@@ -58,37 +58,37 @@ def lookup_genre(artist, title, log=None):
     if not clean_artist or not clean_title:
         return None
 
-    # Use unquoted grouping parenthesis to allow token match flexibility instead of strict phrase matches
-    query = f"artist:({clean_artist}) AND recording:({clean_title})"
+    # Reverting to explicit phrase quotes around stripped parameters for reliable execution
+    query = f'artist:"{clean_artist}" AND recording:"{clean_title}"'
     url = (MB_BASE_URL + "?query=" + urllib.parse.quote(query) +
-           "&fmt=json&limit=3&inc=genres+tags")
+           "&fmt=json&limit=3&inc=genres+tags")[cite: 3]
     
-    data = _mb_request(url)
+    data = _mb_request(url)[cite: 3]
     if not data:
         return None
 
-    recordings = data.get("recordings") or []
+    recordings = data.get("recordings") or [][cite: 3]
     if not recordings:
         return None
 
-    # Check top 3 search entries for usable tags
+    # Check top 3 search entries for usable tags[cite: 3]
     for rec in recordings:
-        genres = rec.get("genres") or []
+        genres = rec.get("genres") or [][cite: 3]
         if genres:
-            best = max(genres, key=lambda g: int(g.get("count", 0) or 0))
-            name = best.get("name")
+            best = max(genres, key=lambda g: int(g.get("count", 0) or 0))[cite: 3]
+            name = best.get("name")[cite: 3]
             if name:
-                return name.title()
+                return name.title()[cite: 3]
 
-        tags = rec.get("tags") or []
+        tags = rec.get("tags") or [][cite: 3]
         if tags:
-            best = max(tags, key=lambda t: int(t.get("count", 0) or 0))
-            name = best.get("name")
+            best = max(tags, key=lambda t: int(t.get("count", 0) or 0))[cite: 3]
+            name = best.get("name")[cite: 3]
             if name:
-                return name.title()
+                return name.title()[cite: 3]
 
     if log:
-        log("GENRE", f"no genre/tags found for cleansed: {clean_artist!r} - {clean_title!r}")
+        log("GENRE", f"no genre/tags found for cleansed: {clean_artist!r} - {clean_title!r}")[cite: 3]
     return None
 
 
