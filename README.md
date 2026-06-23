@@ -33,21 +33,16 @@ Designed to operate entirely headless on embedded hardware, the player discards 
 
 ### 2. Layout 5 Playback Display
 
-<img src="assets/playback_now.svg" alt="Playback Now Playing Screen" width="480" />
+<img src="assets/now_playing_screen.svg" alt="Playback Now Playing Screen" width="480" />
 
 *Visual description:* The central album art box stands out with a modern, blurred $8\text{px}$ drop shadow and $2\text{px}$ black border. Below, the dual single-bar spools are rotating, and the track titles/timer glow in the split-complementary accent color.
 
 ### 3. Concept 2 Split-View Library
 
-<img src="assets/split_library.svg" alt="Concept 2 Split View Library Screen" width="480" />
+<img src="assets/split_library_screen.svg" alt="Concept 2 Split View Library Screen" width="480" />
 
 *Visual description:* On the left, the selected row is highlighted in a vibrant, dynamic theme color. On the right, a split collage showing two album covers represents an artist with multiple records, accompanied by their genre at the bottom.
 
-### 4. Translucent Volume Overlay
-
-<img src="assets/volume_overlay.svg" alt="Translucent Volume Overlay Screen" width="480" />
-
-*Visual description:* Shows a clean, semi-transparent dark volume track laid right on top of the album artwork. When closed, the overlay disappears cleanly leaving no artifact trails or ghost lines.
 
 ## 📂 System Architecture
 
