@@ -481,7 +481,7 @@ class ButtonHandler:
         self.states = {name: {'raw': 1, 'pressed': False, 'start': time.monotonic(), 'long_fired': False, 'repeat': time.monotonic()} for name in self.lines}
 
     def poll(self):
-        clicks, holds, repeats = [], [], [], time.monotonic()
+        clicks, holds, repeats, now = [], [], [], time.monotonic()
         for name, line in self.lines.items():
             state = self.states[name]
             try: val = line.get_value()
