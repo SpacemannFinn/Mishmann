@@ -28,6 +28,7 @@ from upload_server import (
 )
 from genre_fill import GenreFillWorker
 import stats
+import system_health
 
 _LOG_T0 = time.monotonic()
 
@@ -1273,14 +1274,20 @@ def run_settings_screen(bt, upload_srv, buttons, genre_worker=None, tracks=None)
 
     selected, last_redraw = 0, 0.0
     codec_status = get_active_bt_codec()
-    last_codec_check = last_wifi_check = time.monotonic()
+    last_codec_check = last_wifi_check = last_health_check = time.monotonic()
     upload_error = None
     wifi_status = wifi_get_status()
+    used_pct, free_gb, total_gb = system_health.get_disk_usage(MUSIC_ROOT)
+    thermal_status, cpu_temp = system_health.get_thermal_status()
 
     while True:
         now_check = time.monotonic()
         if now_check - last_codec_check > 3.0: codec_status, last_codec_check = get_active_bt_codec(), now_check
         if now_check - last_wifi_check > 5.0: wifi_status, last_wifi_check = wifi_get_status(), now_check
+        if now_check - last_health_check > 10.0:
+            used_pct, free_gb, total_gb = system_health.get_disk_usage(MUSIC_ROOT)
+            thermal_status, cpu_temp = system_health.get_thermal_status()
+            last_health_check = now_check
 
         if upload_srv.is_running(): upload_item = ("Upload Server: ON", f"{upload_srv.get_url_hint()}  pass: {upload_srv.password}")
         elif upload_error: upload_item = ("Upload Server: OFF", upload_error)
@@ -1294,6 +1301,22 @@ def run_settings_screen(bt, upload_srv, buttons, genre_worker=None, tracks=None)
         elif genre_worker.tracks_checked > 0: genre_item = ("Genre Tagging: Idle", f"Last run: checked {genre_worker.tracks_checked}, filled {genre_worker.tracks_filled} (Click to trigger)")
         else: genre_item = ("Genre Tagging: Idle", "Click to scan / fetch missing genres")
 
+        if total_gb:
+            storage_sub = f"{free_gb}GB free of {total_gb}GB ({used_pct}% used)"
+            if used_pct is not None and used_pct >= 90:
+                storage_sub += "  ⚠ low space"
+        else:
+            storage_sub = "Unable to read"
+
+        if cpu_temp is not None:
+            temp_sub = f"{cpu_temp:.0f}°C"
+            if thermal_status == "HOT": temp_sub += "  ⚠ HOT"
+            elif thermal_status == "WARM": temp_sub += "  (warm)"
+        else:
+            temp_sub = "Unable to read"
+
+        uptime_sub = system_health.format_uptime(system_health.get_uptime_s())
+
         items = [
             bt_item,
             ("Brightness", f"{backlight.get_brightness()}%  (Vol +/- to adjust)"),
@@ -1302,6 +1325,9 @@ def run_settings_screen(bt, upload_srv, buttons, genre_worker=None, tracks=None)
             upload_item,
             ("Wi-Fi", wifi_sub),
             ("Listening Stats", f"{stats.get_total_plays()} plays  ·  streak {stats.get_current_streak()}d"),
+            ("Storage", storage_sub),
+            ("CPU Temp", temp_sub),
+            ("Uptime", uptime_sub),
         ]
         if genre_item is not None: items.append(genre_item)
         selected = max(0, min(selected, len(items) - 1))
