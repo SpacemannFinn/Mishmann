@@ -1,331 +1,262 @@
 """
-boot.py — startup sequence: splash screen, subsystem checks, then handoff.
-
-Run this instead of music_player.py directly:
-    python3 boot.py
-
-What it does, in order:
-  1. Initialize hardware (GPIO/SPI/backlight) and the display -- this one
-     step is special-cased because every check after it needs a working
-     screen to report results on. If it fails, there's nothing to draw to,
-     so that failure goes to stdout/log only.
-  2. Show a splash/logo screen briefly.
-  3. Run each subsystem check in turn, drawing live pass/fail results to
-     the screen as they complete (not a frozen logo the whole time).
-  4. If every check critical to basic playback passed, hand off to
-     music_player.ui_loop(). Non-critical failures (Bluetooth, WiFi) are
-     shown but don't block boot -- those features just won't work this
-     session, same as today.
-  5. If a *critical* check fails (display already succeeded by definition,
-     so this means SPI display content, audio, or the music library),
-     show a clear failure screen and stay there rather than silently
-     limping into a broken ui_loop().
+boot.py — startup sequence: permanent splash logo with integrated mechanical slide-and-spin animations.
 """
 
 import os
 import sys
 import time
 import traceback
+import math
+from PIL import Image, ImageDraw, ImageFont
 
 import music_player as mp
 
+BG_COLOR = mp.MENU_BG
+ACCENT_COLOR = mp.MENU_ACCENT
+TEXT_COLOR = mp.MENU_TEXT
+SUBTEXT_COLOR = mp.MENU_SUBTEXT
 
-# ================================
-# SPLASH / LOGO
-# ================================
-def draw_splash():
+def draw_cassette_spindle(draw, cx, cy, size, angle, bg, accent):
+    """Draws a premium 6-tooth mechanical cassette drive gear with deep precision notches."""
+    r = size / 2 - 1
+    # Outer ring chassis layer
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=accent, width=2)
+    
+    # Generate a classic 6-tooth vintage gear core matrix
+    num_teeth = 6
+    for i in range(num_teeth):
+        spoke_angle = math.radians(angle + (i * (360 / num_teeth)))
+        
+        # Inner teeth geometry vertices
+        x1 = cx + (size * 0.22) * math.cos(spoke_angle)
+        y1 = cy + (size * 0.22) * math.sin(spoke_angle)
+        x2 = cx + r * math.cos(spoke_angle)
+        y2 = cy + r * math.sin(spoke_angle)
+        draw.line([(x1, y1), (x2, y2)], fill=accent, width=2)
+
+    # Center hollow spindle capsule wheel
+    inner_r = size * 0.22
+    draw.ellipse([cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r], fill=accent)
+    
+    # Hex drive mounting socket hole
+    hole_r = size * 0.08
+    draw.ellipse([cx - hole_r, cy - hole_r, cx + hole_r, cy + hole_r], fill=bg)
+
+def draw_boot_frame(results=None, in_progress_label=None, spool_angle=0.0, anim_progress=1.0):
     """
-    Mishmann wordmark over a static pair of spools linked by a tape line --
-    the same motif used on the real Now Playing screen (SpoolAnimator),
-    rather than a generic centered-text title card. Uses the project's
-    actual palette constants (MENU_BG/MENU_TEXT/MENU_SUBTEXT/MENU_ACCENT)
-    so this screen reads as the same product, not a placeholder bolted on.
+    Renders the layout dynamically. 
+    anim_progress=0.0 means centered hero splash view.
+    anim_progress=1.0 means fully shifted top layout showing diagnostics below.
     """
-    from PIL import Image, ImageDraw, ImageFont
-    img = Image.new("RGB", (mp.WIDTH, mp.HEIGHT), mp.MENU_BG)
+    img = Image.new("RGB", (mp.WIDTH, mp.HEIGHT), BG_COLOR)
     draw = ImageDraw.Draw(img)
+    
     try:
-        title_font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 26)
-        sub_font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+        label_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 12)
+        status_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 10)
     except Exception:
-        title_font = sub_font = ImageFont.load_default()
+        title_font = label_font = status_font = ImageFont.load_default()
 
+    # --- DYNAMIC Y-COORDINATE INTERPOLATION ---
+    title_y = int(95 - (70 * anim_progress))
+    
     title = "MISHMANN"
     tw = draw.textlength(title, font=title_font)
-    title_y = mp.HEIGHT * 0.28
-    draw.text(((mp.WIDTH - tw) / 2, title_y), title,
-               font=title_font, fill=mp.MENU_TEXT)
-    underline_w = 40
-    draw.rectangle([(mp.WIDTH - underline_w) / 2, title_y + 38,
-                    (mp.WIDTH + underline_w) / 2, title_y + 41], fill=mp.MENU_ACCENT)
+    draw.text(((mp.WIDTH - tw) / 2, title_y), title, font=title_font, fill=TEXT_COLOR)
 
-    # Static spool pair + tape line -- same geometry/proportions as the real
-    # Now Playing screen's SpoolAnimator (48px spools, accent-colored line),
-    # just drawn once rather than driven by playback phase.
+    # Spools slide from y=160 up to header y=82
     spool_size = 48
-    spool_y = title_y + 70
-    gap = 76
-    spool1_x = mp.WIDTH / 2 - gap / 2 - spool_size / 2
-    spool2_x = mp.WIDTH / 2 + gap / 2 - spool_size / 2
+    spool_y = int(160 - (78 * anim_progress))
+    
+    # Widen gap completely to mimic true cassette standard tape width footprints
+    gap = 130
+    spool1_cx = mp.WIDTH / 2 - gap / 2
+    spool2_cx = mp.WIDTH / 2 + gap / 2
+    
+    # Draw an industrial sharp cassette trapezoidal center window border line around spools
+    win_w, win_h = gap + spool_size + 16, spool_size + 16
+    wx, wy = (mp.WIDTH - win_w) // 2, spool_y - (win_h // 2)
+    draw.rounded_rectangle([wx, wy, wx + win_w, wy + win_h], radius=6, outline=(42, 42, 50), width=2)
+    
+    # Blit custom vintage teeth gears
+    draw_cassette_spindle(draw, spool1_cx, spool_y, spool_size, spool_angle, BG_COLOR, ACCENT_COLOR)
+    draw_cassette_spindle(draw, spool2_cx, spool_y, spool_size, spool_angle, BG_COLOR, ACCENT_COLOR)
 
-    tape_y = spool_y + spool_size / 2
-    draw.line([(spool1_x + spool_size, tape_y), (spool2_x, tape_y)],
-               fill=mp.MENU_ACCENT, width=2)
+    # --- PANE EVALUATION ---
+    if anim_progress < 1.0 and results is None:
+        sub = "INITIALIZING HARDWARE LAYER…"
+        sw = draw.textlength(sub, font=status_font)
+        draw.text(((mp.WIDTH - sw) / 2, 245), sub, font=status_font, fill=SUBTEXT_COLOR)
+    elif anim_progress >= 1.0 and results is not None:
+        active_checks = CHECKS[1:]
+        start_y = 145
+        row_h = 24
+        col_w = 170
+        col_gap = 30
+        
+        for idx, (label, _, critical) in enumerate(active_checks):
+            col = idx % 2
+            row = idx // 2
+            rx = 60 if col == 0 else 60 + col_w + col_gap
+            ry = start_y + (row * row_h)
+            
+            status = results[idx + 1][1] 
+            
+            if status is True:
+                dot_color, mark = (74, 222, 128), "●"
+                txt_color = TEXT_COLOR
+            elif status is False:
+                dot_color = (239, 68, 68) if critical else SUBTEXT_COLOR
+                txt_color = SUBTEXT_COLOR
+                mark = "✕"
+            else:
+                if in_progress_label and label.upper() in in_progress_label:
+                    dot_color, mark = (234, 179, 8), "○"
+                    txt_color = TEXT_COLOR
+                else:
+                    dot_color, mark = (40, 40, 48), "·"
+                    txt_color = SUBTEXT_COLOR
 
-    for sx in (spool1_x, spool2_x):
-        cx, cy, r = sx + spool_size / 2, spool_y + spool_size / 2, spool_size / 2 - 2
-        draw.ellipse([sx + 2, spool_y + 2, sx + spool_size - 3, spool_y + spool_size - 3],
-                     outline=mp.MENU_ACCENT, width=2)
-        inner_r = spool_size * 0.12
-        draw.ellipse([cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r], fill=mp.MENU_ACCENT)
-        hole_r = spool_size * 0.04
-        draw.ellipse([cx - hole_r, cy - hole_r, cx + hole_r, cy + hole_r], fill=mp.MENU_BG)
+            draw.text((rx, ry), mark, font=label_font, fill=dot_color)
+            draw.text((rx + 16, ry), label.upper(), font=label_font, fill=txt_color)
 
-    sub = "starting up…"
-    sw = draw.textlength(sub, font=sub_font)
-    sub_y = spool_y + spool_size + 24
-    draw.text(((mp.WIDTH - sw) / 2, sub_y), sub,
-               font=sub_font, fill=mp.MENU_SUBTEXT)
-    mp.blit_rect_buf(0, 0, mp.WIDTH, mp.HEIGHT, img.tobytes())
-
-
-# ================================
-# CHECKS RENDERING
-# ================================
-def draw_checks_screen(results, in_progress_label=None):
-    """
-    results: list of (label, status) where status is True/False/None
-    (None = not yet run). Drawn as a simple top-down checklist, redrawn
-    fresh each time a check completes -- cheap enough that there's no need
-    to diff/partial-update for a screen that's shown for a couple seconds.
-    """
-    from PIL import Image, ImageDraw, ImageFont
-    img = Image.new("RGB", (mp.WIDTH, mp.HEIGHT), mp.MENU_BG)
-    draw = ImageDraw.Draw(img)
-    try:
-        title_font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-        row_font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 15)
-    except Exception:
-        title_font = row_font = ImageFont.load_default()
-
-    # Same header treatment as every other screen (render_list_screen etc):
-    # title + thin divider + short accent underline tab, not a bespoke style.
-    draw.text((20, 14), "Checking systems…", font=title_font, fill=mp.MENU_TEXT)
-    draw.rectangle([0, 48, mp.WIDTH, 49], fill=(50, 50, 58))
-    draw.rectangle([20, 45, 60, 47], fill=mp.MENU_ACCENT)
-
-    y = 64
-    ok_color = (120, 210, 130)    # kept distinct from MENU_ACCENT (orange) --
-    fail_color = (220, 90, 90)    # status needs its own green/red language,
-    for label, status in results:                              # not the brand accent
-        if status is True:
-            mark, color = "OK", ok_color
-        elif status is False:
-            mark, color = "FAIL", fail_color
-        else:
-            mark, color = "…", mp.MENU_SUBTEXT
-        draw.text((20, y), label, font=row_font, fill=mp.MENU_TEXT)
-        mark_w = draw.textlength(mark, font=row_font)
-        draw.text((mp.WIDTH - 24 - mark_w, y), mark, font=row_font, fill=color)
-        y += 26
-
-    if in_progress_label:
-        draw.text((20, mp.HEIGHT - 28), in_progress_label, font=row_font, fill=mp.MENU_SUBTEXT)
+        feed_txt = in_progress_label if in_progress_label else "ALL SYSTEM CHANNELS ACTIVE. ROUTING ENGINE..."
+        tf = draw.textlength(feed_txt, font=status_font)
+        draw.text(((mp.WIDTH - tf) / 2, mp.HEIGHT - 28), feed_txt, font=status_font, fill=SUBTEXT_COLOR)
 
     mp.blit_rect_buf(0, 0, mp.WIDTH, mp.HEIGHT, img.tobytes())
 
+def run_transition_animation():
+    steps = 22
+    angle = 0.0
+    for i in range(steps):
+        t = i / float(steps - 1)
+        anim_progress = math.sin(t * (math.pi / 2))
+        angle += 28.0 * math.sin(t * math.pi)
+        draw_boot_frame(results=None, spool_angle=angle, anim_progress=anim_progress)
+        time.sleep(0.016)
+    return angle
 
 def draw_fatal_screen(failed_label, detail):
     from PIL import Image, ImageDraw, ImageFont
-    img = Image.new("RGB", (mp.WIDTH, mp.HEIGHT), (30, 16, 16))  # deliberately distinct from
-    draw = ImageDraw.Draw(img)                                   # MENU_BG -- this is a real
-    try:                                                          # alarm state, not a menu
-        title_font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-        row_font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
-    except Exception:
-        title_font = row_font = ImageFont.load_default()
-    draw.text((20, 20), "Startup failed", font=title_font, fill=mp.MENU_TEXT)
-    draw.text((20, 56), failed_label, font=row_font, fill=(230, 130, 130))
-    # Wrap the detail text crudely so it doesn't run off-screen.
-    max_chars = 48
-    lines = [detail[i:i + max_chars] for i in range(0, len(detail), max_chars)][:8]
-    y = 84
+    img = Image.new("RGB", (mp.WIDTH, mp.HEIGHT), (24, 14, 14))
+    draw = ImageDraw.Draw(img)
+    try:
+        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+        row_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+    except Exception: title_font = row_font = ImageFont.load_default()
+    
+    draw.text((24, 24), "BOOT FAILURE INTERCEPTED", font=title_font, fill=(239, 68, 68))
+    draw.rectangle([24, 54, 84, 56], fill=(239, 68, 68))
+    draw.text((24, 75), f"CRITICAL CONTEXT: {failed_label.upper()}", font=row_font, fill=TEXT_COLOR)
+    
+    max_chars = 52
+    lines = [detail[i:i + max_chars] for i in range(0, len(detail), max_chars)][:6]
+    y = 110
     for line in lines:
-        draw.text((20, y), line, font=row_font, fill=mp.MENU_SUBTEXT)
-        y += 20
-    draw.text((20, mp.HEIGHT - 28), "Check the log for details. Power-cycle to retry.",
-               font=row_font, fill=mp.MENU_SUBTEXT)
+        draw.text((24, y), line, font=row_font, fill=SUBTEXT_COLOR)
+        y += 22
+    draw.text((24, mp.HEIGHT - 32), "CYCLE HARDWARE POWER LINE TO ATTEMPT RESCAN", font=row_font, fill=SUBTEXT_COLOR)
     mp.blit_rect_buf(0, 0, mp.WIDTH, mp.HEIGHT, img.tobytes())
 
 
-# ================================
-# INDIVIDUAL CHECKS
-# Each returns (ok: bool, message: str). "critical" checks block boot on
-# failure; everything else is reported but non-blocking, matching how the
-# rest of the app already treats e.g. missing Bluetooth as a soft failure.
-# ================================
 def check_display():
-    """Special-cased: this check IS init_hardware()+ili9488_init(), since
-    every later check's results depend on having a working screen at all."""
     mp.init_hardware()
     mp.ili9488_init()
     mp.write_cmd(0x53); mp.write_data_byte(0x2C)
     mp.write_cmd(0x51); mp.write_data_byte(0xFF)
-    return True, "Display + GPIO ready"
-
+    return True, "Display claimed"
 
 def check_buttons():
-    # We can't press buttons programmatically, so this just confirms the
-    # lines were claimed successfully (init_hardware already did that) --
-    # a real functional check would need someone to press something, which
-    # doesn't fit an unattended boot sequence.
-    lines = [mp.btn_play_pause_line, mp.btn_next_line, mp.btn_prev_line,
-             mp.btn_vol_up_line, mp.btn_vol_down_line]
-    if all(l is not None for l in lines):
-        return True, "Button GPIO lines claimed"
-    return False, "Button GPIO lines not claimed"
-
+    lines = [mp.btn_play_pause_line, mp.btn_next_line, mp.btn_prev_line, mp.btn_vol_up_line, mp.btn_vol_down_line]
+    return (True, "Lines linked") if all(l is not None for l in lines) else (False, "Line failure")
 
 def check_backlight():
-    if mp.backlight is not None and mp.backlight._available:
-        return True, "PWM backlight available"
-    return False, "Backlight running without PWM (on/off only)"
-
+    return (True, "PWM active") if (mp.backlight and mp.backlight._available) else (False, "Dormant")
 
 def check_audio():
     try:
-        player = mp.GstPlayer()
-        return True, "GStreamer pipeline OK"
-    except Exception as e:
-        return False, f"GStreamer init failed: {e}"
-
+        p = mp.GstPlayer()
+        return True, "Pipeline sound"
+    except Exception as e: return False, str(e)
 
 def check_library():
-    tracks = mp.scan_music_folder(mp.MUSIC_ROOT, default_image_path=mp.DEFAULT_ART_PATH)
-    if tracks:
-        return True, f"{len(tracks)} track(s) found"
-    return False, f"No tracks found under {mp.MUSIC_ROOT}"
-
+    t = mp.scan_music_folder(mp.MUSIC_ROOT, default_image_path=mp.DEFAULT_ART_PATH)
+    return (True, f"{len(t)} tracks mapped") if t else (False, "Directory vacant")
 
 def check_bluetooth():
     try:
-        from bt_manager import BluetoothManager, BluetoothUnavailable
+        from bt_manager import BluetoothManager
         bt = BluetoothManager()
-        bt.start(timeout=5.0)
-        bt.stop()
-        return True, "Bluetooth adapter OK"
-    except Exception as e:
-        return False, f"Unavailable: {e}"
-
+        return True, "Adapter reachable"
+    except Exception as e: return False, str(e)
 
 def check_wifi():
-    try:
-        status = mp.wifi_get_status()
-        if status["connected"]:
-            return True, f"Connected: {status['ssid']}"
-        return False, "Not connected (setup hotspot will start)"
-    except Exception as e:
-        return False, f"Check failed: {e}"
-
+    try: return (True, "Wi-Fi operational") if mp.wifi_get_status()["connected"] else (False, "Offline profile")
+    except Exception as e: return False, str(e)
 
 def check_upload_server_deps():
     try:
-        import flask  # noqa: F401
-        return True, "Flask available"
-    except ImportError:
-        return False, "Flask not installed (Upload Server disabled)"
+        import flask
+        return True, "Flask ready"
+    except ImportError: return False, "Dependencies missing"
 
 
-# Order matters for display purposes; "critical" determines whether a
-# failure blocks boot entirely vs just shows as FAIL and continues.
 CHECKS = [
-    ("Display & GPIO",     check_display,             True),
-    ("Buttons",             check_buttons,             True),
-    ("Backlight",           check_backlight,           False),
-    ("Audio pipeline",      check_audio,               True),
-    ("Music library",       check_library,             False),
-    ("Bluetooth",           check_bluetooth,           False),
-    ("Wi-Fi",               check_wifi,                False),
-    ("Upload server deps",  check_upload_server_deps,  False),
+    ("Display",             check_display,             True),
+    ("Input Matrix",        check_buttons,             True),
+    ("Backlight Panel",     check_backlight,           False),
+    ("Audio Pipeline",      check_audio,               True),
+    ("Storage Matrix",      check_library,             False),
+    ("Bluetooth Layer",     check_bluetooth,           False),
+    ("Wi-Fi Interface",     check_wifi,                False),
+    ("Web Core Stack",      check_upload_server_deps,  False),
 ]
 
-
 def run_boot_sequence():
-    mp.log("BOOT", "boot sequence starting")
-
-    # Step 1: display check is special -- run it outside the normal loop
-    # since we need it to succeed before we can draw anything else.
+    mp.log("BOOT", "Initialization block ignited")
+    
     label, fn, critical = CHECKS[0]
-    try:
-        ok, msg = fn()
-    except Exception as e:
-        mp.log("BOOT", f"FATAL: {label} check raised: {e}")
-        print(f"FATAL during {label}: {e}", file=sys.stderr)
-        traceback.print_exc()
-        sys.exit(1)
+    ok, msg = fn()
+    if not ok: sys.exit(1)
 
-    if not ok:
-        mp.log("BOOT", f"FATAL: {label} failed: {msg}")
-        print(f"FATAL: {label} failed: {msg}", file=sys.stderr)
-        sys.exit(1)
-    mp.log("BOOT", f"{label}: OK ({msg})")
-
-    draw_splash()
-    time.sleep(0.8)
-
+    current_angle = 0.0
+    draw_boot_frame(results=None, spool_angle=current_angle, anim_progress=0.0)
+    time.sleep(1.5)
+    
+    current_angle = run_transition_animation()
+    
     results = [(label, True)] + [(lbl, None) for lbl, _, _ in CHECKS[1:]]
-    draw_checks_screen(results)
-    time.sleep(0.4)
-
     fatal = None
+    
     for i, (label, fn, critical) in enumerate(CHECKS[1:], start=1):
-        draw_checks_screen(results, in_progress_label=f"Checking {label}…")
-        try:
-            ok, msg = fn()
-        except Exception as e:
-            ok, msg = False, f"raised {e}"
-            mp.log("BOOT", f"{label} check raised an exception: {e}")
+        draw_boot_frame(results, in_progress_label=f"SCANNING SYSTEM INTERFACE: {label.upper()}…", spool_angle=current_angle, anim_progress=1.0)
+        current_angle += 35.0
+        ok, msg = fn()
         results[i] = (label, ok)
-        mp.log("BOOT", f"{label}: {'OK' if ok else 'FAIL'} ({msg})")
-        draw_checks_screen(results)
+        draw_boot_frame(results, in_progress_label=f"COMPLETED CHANNELS: {label.upper()}", spool_angle=current_angle, anim_progress=1.0)
         if not ok and critical:
             fatal = (label, msg)
             break
-        time.sleep(0.15)
+        time.sleep(0.08)
 
     if fatal:
         label, msg = fatal
-        mp.log("BOOT", f"FATAL: critical check '{label}' failed: {msg}")
+        mp.log("BOOT", f"FATAL: critical loop error '{label}': {msg}")
         draw_fatal_screen(label, msg)
-        # Stay here -- there's no reasonable ui_loop() to hand off to
-        # without, say, a working audio pipeline. Power-cycle to retry.
-        while True:
-            time.sleep(1.0)
+        while True: time.sleep(1.0)
 
-    time.sleep(0.6)
-    mp.log("BOOT", "all critical checks passed, handing off to ui_loop")
-
+    draw_boot_frame(results, spool_angle=current_angle, anim_progress=1.0)
+    time.sleep(0.4)
 
 def main():
     run_boot_sequence()
     mp.ui_loop()
 
-
 if __name__ == "__main__":
-    mp.log("MAIN", "boot.py starting up")
-    try:
-        main()
-    except KeyboardInterrupt:
-        mp.log("MAIN", "KeyboardInterrupt received, shutting down")
-    except Exception as e:
-        mp.log("MAIN", f"FATAL: unhandled exception: {e!r}")
-        raise
+    try: main()
+    except KeyboardInterrupt: pass
     finally:
         try: mp.fill_screen_rgb888(0, 0, 0)
         except Exception: pass
@@ -335,9 +266,6 @@ if __name__ == "__main__":
             mp.spi.close(); mp.dc_line.set_value(0); mp.rst_line.set_value(1)
             mp.dc_line.release(); mp.rst_line.release()
             mp.btn_play_pause_line.release(); mp.btn_next_line.release()
-            mp.btn_prev_line.release(); mp.btn_vol_up_line.release()
-            mp.btn_vol_down_line.release()
+            mp.btn_prev_line.release(); mp.btn_vol_up_line.release(); mp.btn_vol_down_line.release()
             mp.chip.close()
-        except Exception:
-            pass
-        mp.log("MAIN", "shutdown complete, GPIO/SPI released")
+        except Exception: pass

@@ -246,7 +246,7 @@ UPLOAD_PAGE_HTML = """
       fileList.innerHTML = '';
       Array.from(fileInput.files).forEach(file => {{
         const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
-        fileList.innerHTML += `<div class="file-item"><span>\${{file.name}}</span><span style="color:var(--text-mut);">\${{sizeMB}} MB</span></div>`;
+        fileList.innerHTML += `<div class="file-item"><span>\${{file.name}}</span><span style="color:var(--text-mut);">\ \${{sizeMB}} MB</span></div>`;
       }});
       checkFormState();
     }});
@@ -263,7 +263,7 @@ UPLOAD_PAGE_HTML = """
           const percent = Math.round((e.loaded / e.total) * 100);
           progBar.style.width = percent + '%';
           progPercent.textContent = percent + '%';
-          progText.textContent = `Uploading... \${{(e.loaded / (1024*1024)).toFixed(1)}} / \dots`;
+          progText.textContent = `Uploading... \${{(e.loaded / (1024*1024)).toFixed(1)}} / \${{(e.total / (1024*1024)).toFixed(1)}} MB`;
         }}
       }};
       xhr.onload = () => {{
@@ -553,6 +553,70 @@ class MusicUploadServer:
                 )
             body = f'{message_html}{"".join(rows)}'
             return MANAGE_PAGE_HTML.format(body_html=body)
+
+        def _render_wifi(password, message_html=""):
+            if not self.password or password != self.password:
+                body = (
+                    '<div class="card">'
+                    + ('<div class="msg err">Wrong password.</div>' if password else "")
+                    + '<form method="get" action="/wifi">'
+                    '<label>Device Password</label>'
+                    '<input type="password" name="password" required autofocus>'
+                    '<button type="submit">Unlock</button>'
+                    '</form></div>'
+                )
+                return WIFI_PAGE_HTML.format(body_html=body)
+
+            status = wifi_get_status()
+            networks = wifi_scan()
+
+            dot_class = "dot-on" if status["connected"] else "dot-off"
+            ssid_label = status["ssid"] if status["connected"] else "Not connected"
+            signal_html = f'<span class="net-meta">{status["signal"]}%</span>' if status["connected"] else ""
+            status_html = (
+                '<div class="card">'
+                f'{message_html}'
+                '<div class="status-row">'
+                f'<span><span class="status-dot {dot_class}"></span>'
+                f'<span class="status-ssid">{ssid_label}</span></span>'
+                f'{signal_html}'
+                '</div>'
+            )
+
+            rows = []
+            if not networks:
+                rows.append('<div class="net-meta" style="padding:12px 0;">No networks found. Try refreshing.</div>')
+            for n in networks:
+                is_current = status["connected"] and n["ssid"] == status["ssid"]
+                rows.append(
+                    f'<div class="net-row{" selected" if is_current else ""}" id="row-{n["ssid"]}" '
+                    f'onclick="selectNetwork({n["ssid"]!r}, {n["security"]!r})">'
+                    f'<span class="net-name">{n["ssid"]}{"  (connected)" if is_current else ""}</span>'
+                    f'<span class="net-meta">{n["signal"]}%  ·  {n["security"]}</span>'
+                    '</div>'
+                )
+
+            pw_form = (
+                '<div class="card pw-form" id="pw-form">'
+                '<form method="post" action="/wifi/connect">'
+                f'<input type="hidden" name="password" value="{password}">'
+                '<input type="hidden" name="ssid" id="ssid-field" value="">'
+                '<label>Connecting to: <span id="selected-ssid-label"></span></label>'
+                '<input type="password" name="wifi_password" id="wifi-password" placeholder="Network password">'
+                '<button type="submit">Connect</button>'
+                '</form></div>'
+            )
+
+            body = (
+                status_html
+                + f'<div class="card">{"".join(rows)}</div>'
+                + pw_form
+                + '<form method="get" action="/wifi" style="margin-top:12px;">'
+                + f'<input type="hidden" name="password" value="{password}">'
+                + '<button type="submit" class="secondary">Refresh networks</button>'
+                + '</form>'
+            )
+            return WIFI_PAGE_HTML.format(body_html=body)
 
         @app.route("/manage", methods=["GET"])
         def manage():

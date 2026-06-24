@@ -27,6 +27,7 @@ from upload_server import (
     HOTSPOT_SSID, HOTSPOT_PASSWORD, HOTSPOT_GATEWAY_IP,
 )
 from genre_fill import GenreFillWorker
+import stats
 
 _LOG_T0 = time.monotonic()
 
@@ -518,13 +519,15 @@ class ButtonHandler:
         self.prev_brightness = 100
         self.dim_val = 10
         
+        self.click_history = []
+        
         # Start background polling immediately
         self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="button-poll")
         self._thread.start()
 
     def _poll_loop(self):
         """Centralized high-frequency loop implementing broad-envelope global inactivity dimming."""
-        IDLE_TIMEOUT_S = 120.0  # 2 Minutes global threshold timeout margin
+        IDLE_TIMEOUT_S = 120.0  
         
         while self._running:
             now = time.monotonic()
@@ -545,15 +548,26 @@ class ButtonHandler:
                 
                 # Button Release Detected (Rising Edge)
                 elif state['raw'] == 0 and val == 1:
-                    if (now - state['start']) >= 0.05 and not state['long_fired']: 
-                        # Only forward interactive frame events if display pipelines are fully illuminated
-                        if not self.screen_is_sleeping:
-                            self.event_queue.put(("click", name))
+                    if (now - state['start']) >= 0.02: 
+                        if (now - state['start']) < 0.5:
+                            if name == "play_pause":
+                                self.click_history = [t for t in self.click_history if now - t < 1.2]
+                                self.click_history.append(now)
+                                
+                                if len(self.click_history) >= 4:
+                                    self.event_queue.put(("quad_click_pause", name))
+                                    self.click_history.clear()
+                                elif not self.screen_is_sleeping:
+                                    self.event_queue.put(("click", name))
+                            else:
+                                if not self.screen_is_sleeping:
+                                    self.event_queue.put(("click", name))
+                                
                     state.update({'pressed': False, 'start': 0.0})
                     self.last_interaction_time = now
                     activity_detected = True
                 
-                # Handle active holds and repeats
+                # Handle active holds and repeats (Enforce a strict hold window ceiling)
                 if state['pressed'] and val == 0:
                     activity_detected = True
                     self.last_interaction_time = now
@@ -574,7 +588,6 @@ class ButtonHandler:
             if activity_detected and self.screen_is_sleeping:
                 self.screen_is_sleeping = False
                 self.backlight.fade_to(self.prev_brightness, duration_s=0.15)
-                # Flush execution filters instantly to absorb initial wake clicks cleanly
                 while not self.event_queue.empty():
                     try: self.event_queue.get_nowait()
                     except queue.Empty: break
@@ -591,7 +604,9 @@ class ButtonHandler:
         while True:
             try:
                 ev_type, name = self.event_queue.get_nowait()
-                if ev_type == "click":
+                if ev_type == "quad_click_pause":
+                    holds.append("quad_click_pause")
+                elif ev_type == "click":
                     clicks.append(name)
                 elif ev_type == "hold":
                     holds.append(name)
@@ -723,6 +738,7 @@ def run_wifi_setup_screen(buttons, get_status_fn, timeout_check_interval=2.0):
                 return
             last_check = now
         clicks, holds, repeats = buttons.poll()
+        if "quad_click_pause" in holds: return
         if holds:
             log("WIFI", "setup screen skipped by user (held button)")
             return
@@ -734,70 +750,90 @@ def render_list_screen(title, items, selected_index, footer=None):
 
     try:
         title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-        row_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 17)
-        sub_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13)
-        section_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 12)
+        row_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 15)
+        sub_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+        panel_hdr_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+        panel_body_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13)
+        section_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11)
     except Exception:
-        title_font = row_font = sub_font = section_font = ImageFont.load_default()
+        title_font = row_font = sub_font = panel_hdr_font = panel_body_font = section_font = ImageFont.load_default()
 
-    draw.text((20, 14), title, font=title_font, fill=MENU_TEXT)
-    draw.rectangle([0, HEADER_H - 1, WIDTH, HEADER_H - 1], fill=(50, 50, 58))
-    draw.rectangle([20, HEADER_H - 4, 60, HEADER_H - 2], fill=MENU_ACCENT)
+    left_pane_w = 255
+    draw.text((24, 15), title.upper(), font=title_font, fill=MENU_TEXT)
+    draw.rectangle([0, HEADER_H - 1, WIDTH, HEADER_H - 1], fill=(44, 44, 52))
+    draw.rectangle([24, HEADER_H - 4, 64, HEADER_H - 2], fill=MENU_ACCENT)
 
     heights = [SECTION_H if it[0] == SECTION_MARKER else ROW_H for it in items]
     sel_positions = [i for i, it in enumerate(items) if it[0] != SECTION_MARKER]
-
-    avail_h = HEIGHT - HEADER_H - (28 if footer else 6)
     target_item_idx = sel_positions[selected_index] if sel_positions else 0
+
+    avail_h = HEIGHT - HEADER_H - (30 if footer else 10)
     scroll_px = 0
     if sum(heights) > avail_h:
         y_of_target = sum(heights[:target_item_idx])
-        scroll_px = max(0, min(y_of_target - avail_h // 2, sum(heights) - avail_h))
+        scroll_px = max(0, min(y_of_target - avail_h // 2 + (ROW_H // 2), sum(heights) - avail_h))
 
-    thumb_size = ROW_H - 8
-    text_x_with_thumb = 24 + thumb_size + 12
-
+    # --- LEFT PANE ---
     y = HEADER_H - scroll_px
     for i, it in enumerate(items):
         h = heights[i]
         if y + h <= HEADER_H:
             y += h
             continue
-        if y >= HEIGHT - (28 if footer else 0):
-            break
-        if y < HEADER_H:
-            y += h
-            continue
+        if y >= HEIGHT - (30 if footer else 0): break
 
         if it[0] == SECTION_MARKER:
-            draw.text((24, y + 6), it[1], font=section_font, fill=MENU_ACCENT)
+            draw.text((24, y + 8), it[1].upper(), font=section_font, fill=MENU_ACCENT)
         else:
             label = it[0]
-            subtext = it[1] if len(it) > 1 else None
-            thumb = it[2] if len(it) > 2 else None
-
             is_sel = (i == target_item_idx)
+            
             if is_sel:
-                draw.rectangle([0, y, WIDTH, y + h - 1], fill=MENU_HILITE_BG)
-                draw.rectangle([0, y, 4, y + h - 1], fill=MENU_ACCENT)
-
-            text_color = MENU_TEXT if is_sel else MENU_SUBTEXT
-            if thumb is not None:
-                thumb_y = y + (h - thumb_size) // 2
-                img.paste(thumb, (24, thumb_y))
-                text_x = text_x_with_thumb
+                draw.rectangle([12, y + 3, left_pane_w - 8, y + h - 3], fill=(44, 44, 56))
+                draw.rectangle([12, y + 3, 16, y + h - 3], fill=MENU_ACCENT)
+                txt_color = MENU_TEXT
             else:
-                text_x = 24
+                txt_color = (200, 202, 210)
 
-            ty = y + (8 if subtext else 12)
-            draw.text((text_x, ty), label, font=row_font, fill=text_color)
-            if subtext:
-                draw.text((text_x, ty + 19), subtext, font=sub_font, fill=MENU_SUBTEXT)
+            draw.text((28, y + 12), label, font=row_font, fill=txt_color)
         y += h
 
+    # --- RIGHT PANEL ---
+    panel_bg = (18, 18, 22)
+    draw.rectangle([left_pane_w, HEADER_H, WIDTH, HEIGHT], fill=panel_bg)
+    draw.line([(left_pane_w, HEADER_H), (left_pane_w, HEIGHT)], fill=(44, 44, 52), width=1)
+
+    if selected_index < len(sel_positions):
+        active_row_idx = sel_positions[selected_index]
+        label_text = items[active_row_idx][0]
+        sub_text = items[active_row_idx][1] if len(items[active_row_idx]) > 1 else ""
+
+        px = left_pane_w + 18
+        draw.text((px, HEADER_H + 20), "SYSTEM VARIABLE", font=sub_font, fill=MENU_ACCENT)
+        draw.text((px, HEADER_H + 36), label_text.upper(), font=panel_hdr_font, fill=MENU_TEXT)
+        draw.line([(px, HEADER_H + 58), (WIDTH - 18, HEADER_H + 58)], fill=(36, 36, 42), width=1)
+
+        if sub_text:
+            text_space = WIDTH - px - 18
+            lines, current_line = [], ""
+            for word in sub_text.split(" "):
+                test_line = f"{current_line} {word}".strip()
+                if draw.textlength(test_line, font=panel_body_font) <= text_space:
+                    current_line = test_line
+                else:
+                    lines.append(current_line)
+                    current_line = word
+            if current_line: lines.append(current_line)
+
+            ly = HEADER_H + 74
+            for line in lines[:5]:
+                draw.text((px, ly), line, font=panel_body_font, fill=MENU_SUBTEXT)
+                ly += 20
+
     if footer:
-        draw.rectangle([0, HEIGHT - 26, WIDTH, HEIGHT - 26], fill=(50, 50, 58))
-        draw.text((20, HEIGHT - 21), footer, font=sub_font, fill=MENU_SUBTEXT)
+        draw.rectangle([0, HEIGHT - 28, left_pane_w, HEIGHT], fill=MENU_BG)
+        draw.line([(0, HEIGHT - 28), (left_pane_w, HEIGHT - 28)], fill=(44, 44, 52), width=1)
+        draw.text((24, HEIGHT - 19), footer.lower(), font=sub_font, fill=MENU_SUBTEXT)
 
     return img
 
@@ -944,6 +980,9 @@ def _is_named(dev): return dev["name"] != dev["address"]
 
 def run_bluetooth_screen(bt, buttons):
     log("BT", "entered Bluetooth screen, starting scan")
+    
+    if buttons: buttons.poll()
+        
     show_all = False
     selected = 0
     status_msg = None
@@ -953,16 +992,24 @@ def run_bluetooth_screen(bt, buttons):
 
     while True:
         now = time.monotonic()
+        
+        clicks, holds, repeats = buttons.poll()
+        if "quad_click_pause" in holds:
+            bt.stop_scan()
+            return "quad_click_pause"
+            
+        for ev in holds:
+            if ev in ("prev", "play_pause"):
+                bt.stop_scan()
+                return
+
         for kind, payload in bt.get_events():
             addr = payload.get("address") if isinstance(payload, dict) else None
-            log("BT", f"event: {kind} {payload}")
             if addr != last_action_addr: continue
             if kind == "pair_result": status_msg = "Paired!" if payload["ok"] else f"Pair failed: {payload.get('error', '?')}"
             elif kind == "connect_result":
                 status_msg = "Connected!" if payload["ok"] else f"Connect failed: {payload.get('error', '?')}"
-                if payload["ok"]:
-                    log("BT", f"auto-trusting {last_action_addr} after successful connect")
-                    bt.trust(last_action_addr)
+                if payload["ok"]: bt.trust(last_action_addr)
             elif kind == "disconnect_result": status_msg = "Disconnected" if payload["ok"] else f"Disconnect failed: {payload.get('error', '?')}"
             elif kind == "remove_result": status_msg = "Forgotten" if payload["ok"] else f"Remove failed: {payload.get('error', '?')}"
 
@@ -972,9 +1019,8 @@ def run_bluetooth_screen(bt, buttons):
         if not show_all: available = [d for d in available if _is_named(d)]
         available.sort(key=lambda d: -(d["rssi"] or -999))
 
-        items = []
+        items = [(SECTION_MARKER, "PAIRED")]
         selectable_devices = []
-        items.append((SECTION_MARKER, "PAIRED"))
         if paired:
             for d in paired:
                 items.append(_bt_device_label(d))
@@ -997,15 +1043,9 @@ def run_bluetooth_screen(bt, buttons):
 
         selected = max(0, min(selected, len(selectable_devices) - 1))
         if now - last_redraw > 0.2:
-            img = render_list_screen("Bluetooth", items, selected, footer=status_msg or "Hold Prev: back   Play: select")
+            img = render_list_screen("Bluetooth", items, selected, footer="Hold Prev: back   Play: select")
             blit_rect_buf(0, 0, WIDTH, HEIGHT, img.tobytes())
             last_redraw = now
-
-        clicks, holds, repeats = buttons.poll()
-        for ev in holds:
-            if ev in ("prev", "play_pause"):
-                bt.stop_scan()
-                return
 
         for ev in clicks:
             if ev == "next":
@@ -1051,33 +1091,24 @@ class ThumbnailCacheWorker:
         self._stop_event = threading.Event()
 
     def start(self, tracks, sizes=[140, 160]):
-        if self.is_running:
-            return
+        if self.is_running: return
         self.is_running = True
         self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run, 
-            args=(tracks, sizes), 
-            daemon=True, 
-            name="thumbnail-cache"
-        )
+        self._thread = threading.Thread(target=self._run, args=(tracks, sizes), daemon=True, name="thumbnail-cache")
         self._thread.start()
 
     def stop(self):
         self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+        if self._thread and self._thread.is_alive(): self._thread.join(timeout=2.0)
         self.is_running = False
 
     def _run(self, tracks, sizes):
         self.log("CACHE", f"Starting background pre-cache for {len(tracks)} tracks...")
         try:
             for track in tracks:
-                if self._stop_event.is_set():
-                    break
+                if self._stop_event.is_set(): break
                 for size in sizes:
-                    if self._stop_event.is_set():
-                        break
+                    if self._stop_event.is_set(): break
                     _get_thumbnail(track, size)
             self.log("CACHE", "Background pre-cache cycle complete.")
         except Exception as e:
@@ -1134,8 +1165,7 @@ def _get_collage_thumbnail(tracks, size):
     if not thumbs: return None
 
     positions = [(0, 0), (half, 0), (0, half), (half, half)]
-    for i in range(4):
-        collage.paste(thumbs[i % len(thumbs)], positions[i])
+    for i in range(4): collage.paste(thumbs[i % len(thumbs)], positions[i])
 
     draw = ImageDraw.Draw(collage)
     draw.line([(half, 0), (half, size)], fill=(15, 15, 20), width=2)
@@ -1144,9 +1174,7 @@ def _get_collage_thumbnail(tracks, size):
     return collage
 
 def _get_primary_artist(artist_string):
-    """Extracts only the first primary artist from a multi-artist string."""
-    if not artist_string:
-        return "Unknown Artist"
+    if not artist_string: return "Unknown Artist"
     delimiters = r'(?i)\s+(feat\.?|ft\.?|featuring|vs\.?|with|and|\&)\s+|[,;/\\]+\s*'
     primary = re.split(delimiters, artist_string)[0]
     return primary.strip() or "Unknown Artist"
@@ -1162,6 +1190,9 @@ def _group_tracks(tracks):
 
 def run_library_screen(tracks, buttons, bt=None, upload_srv=None, genre_worker=None):
     log("MENU", "entered Library (Split View)")
+    
+    if buttons: buttons.poll()
+        
     by_artist = _group_tracks(tracks)
     artists = sorted(by_artist.keys())
 
@@ -1179,14 +1210,9 @@ def run_library_screen(tracks, buttons, bt=None, upload_srv=None, genre_worker=N
                 count = sum(len(v) for v in albums_dict.values())
                 first_album = sorted(albums_dict.keys())[0]
                 _, rep_track = albums_dict[first_album][0]
-                
-                rep_list = []
-                for alb in sorted(albums_dict.keys()):
-                    rep_list.append(albums_dict[alb][0][1])
-
+                rep_list = [albums_dict[alb][0][1] for alb in sorted(albums_dict.keys())]
                 genre = rep_track.get("genre") or "Unknown Genre"
                 items.append((a, rep_list if len(rep_list) > 1 else rep_track, f"{count} track(s)", genre))
-        
         elif level == "album":
             title = cur_artist
             albums = sorted(by_artist[cur_artist].keys())
@@ -1195,7 +1221,6 @@ def run_library_screen(tracks, buttons, bt=None, upload_srv=None, genre_worker=N
                 _, rep_track = track_list[0]
                 genre = rep_track.get("genre") or "Unknown Genre"
                 items.append((al, rep_track, f"{len(track_list)} track(s)", f"{cur_artist} · {genre}"))
-        
         else:
             title = cur_album
             track_list = by_artist[cur_artist][cur_album]
@@ -1213,10 +1238,13 @@ def run_library_screen(tracks, buttons, bt=None, upload_srv=None, genre_worker=N
             last_redraw = now
 
         clicks, holds, repeats = buttons.poll()
+        if "quad_click_pause" in holds: return "quad_click_pause"
+
         for ev in holds:
             if ev == "play_pause":
                 if bt is not None or upload_srv is not None:
-                    run_settings_screen(bt, upload_srv, buttons, genre_worker, tracks)
+                    res = run_settings_screen(bt, upload_srv, buttons, genre_worker, tracks)
+                    if res == "quad_click_pause": return "quad_click_pause"
                     last_redraw = 0.0
                 else:
                     return None
@@ -1232,29 +1260,27 @@ def run_library_screen(tracks, buttons, bt=None, upload_srv=None, genre_worker=N
             elif ev == "play_pause":
                 if level == "artist": cur_artist, level, selected, last_redraw = artists[selected], "album", 0, 0.0
                 elif level == "album": cur_album, level, selected, last_redraw = sorted(by_artist[cur_artist].keys())[selected], "track", 0, 0.0
-                else:
-                    return by_artist[cur_artist][cur_album][selected][0]
+                else: return by_artist[cur_artist][cur_album][selected][0]
         time.sleep(0.02)
 
 
 def run_settings_screen(bt, upload_srv, buttons, genre_worker=None, tracks=None):
     log("MENU", "entered Settings")
+    
+    if buttons: buttons.poll()
+        
     bt_item = ("Bluetooth", "Pair & connect devices") if bt is not None else ("Bluetooth", "Unavailable on this device")
 
-    selected = 0
-    last_redraw = 0.0
+    selected, last_redraw = 0, 0.0
     codec_status = get_active_bt_codec()
-    last_codec_check = time.monotonic()
+    last_codec_check = last_wifi_check = time.monotonic()
     upload_error = None
     wifi_status = wifi_get_status()
-    last_wifi_check = time.monotonic()
 
     while True:
         now_check = time.monotonic()
-        if now_check - last_codec_check > 3.0:
-            codec_status, last_codec_check = get_active_bt_codec(), now_check
-        if now_check - last_wifi_check > 5.0:
-            wifi_status, last_wifi_check = wifi_get_status(), now_check
+        if now_check - last_codec_check > 3.0: codec_status, last_codec_check = get_active_bt_codec(), now_check
+        if now_check - last_wifi_check > 5.0: wifi_status, last_wifi_check = wifi_get_status(), now_check
 
         if upload_srv.is_running(): upload_item = ("Upload Server: ON", f"{upload_srv.get_url_hint()}  pass: {upload_srv.password}")
         elif upload_error: upload_item = ("Upload Server: OFF", upload_error)
@@ -1275,6 +1301,7 @@ def run_settings_screen(bt, upload_srv, buttons, genre_worker=None, tracks=None)
             ("Audio Codec", f"{codec_status}  (read-only)"),
             upload_item,
             ("Wi-Fi", wifi_sub),
+            ("Listening Stats", f"{stats.get_total_plays()} plays  ·  streak {stats.get_current_streak()}d"),
         ]
         if genre_item is not None: items.append(genre_item)
         selected = max(0, min(selected, len(items) - 1))
@@ -1286,6 +1313,7 @@ def run_settings_screen(bt, upload_srv, buttons, genre_worker=None, tracks=None)
             last_redraw = now
 
         clicks, holds, repeats = buttons.poll()
+        if "quad_click_pause" in holds: return "quad_click_pause"
         for ev in holds:
             if ev in ("prev", "play_pause"): return
 
@@ -1298,7 +1326,9 @@ def run_settings_screen(bt, upload_srv, buttons, genre_worker=None, tracks=None)
             if ev == "next": selected = min(selected + 1, len(items) - 1)
             elif ev == "prev": selected = max(selected - 1, 0)
             elif ev == "play_pause":
-                if selected == 0 and bt is not None: run_bluetooth_screen(bt, buttons)
+                if selected == 0 and bt is not None:
+                    res = run_bluetooth_screen(bt, buttons)
+                    if res == "quad_click_pause": return "quad_click_pause"
                 elif selected == 2: run_screen_off(buttons)
                 elif selected == 4:
                     if upload_srv.is_running():
@@ -1309,15 +1339,137 @@ def run_settings_screen(bt, upload_srv, buttons, genre_worker=None, tracks=None)
                             upload_srv.start()
                             upload_error = None
                         except UploadServerUnavailable as e:
-                            upload_error = "Flask not installed (see log)" if "Flask isn't installed" in str(e) else "Couldn't start"
-                
+                            upload_error = "Flask not installed" if "Flask isn't installed" in str(e) else "Couldn't start"
+                elif selected == 6:
+                    res = run_stats_screen(buttons, tracks)
+                    if res == "quad_click_pause": return "quad_click_pause"
                 elif genre_item is not None and selected == len(items) - 1:
                     if not genre_worker.is_running:
-                        if wifi_get_status()["connected"] and tracks:
-                            log("GENRE", "Manual trigger recognized. Overwriting all tracks.")
-                            genre_worker.start(tracks, force_full=True)
-                        else:
-                            log("GENRE", "On-demand execution aborted: Wi-Fi offline or empty library profile.")
+                        if wifi_get_status()["connected"] and tracks: genre_worker.start(tracks, force_full=True)
+        time.sleep(0.02)
+
+
+def _track_label(tracks_by_path, file_path):
+    t = tracks_by_path.get(file_path)
+    if t is None:
+        return os.path.basename(file_path), ""
+    return t.get("title") or os.path.basename(file_path), t.get("artist", "")
+
+
+def _draw_stats_summary(tracks_by_path):
+    img = Image.new("RGB", (WIDTH, HEIGHT), MENU_BG)
+    draw = ImageDraw.Draw(img)
+    title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+    label_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+    row_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13)
+
+    draw.text((20, 14), "Listening Stats", font=title_font, fill=MENU_TEXT)
+    draw.rectangle([0, 48, WIDTH, 49], fill=(50, 50, 58))
+
+    total = stats.get_total_plays()
+    streak = stats.get_current_streak()
+    draw.text((20, 60), f"{total}", font=ImageFont.truetype(
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 26), fill=MENU_ACCENT)
+    draw.text((20, 90), "total plays", font=row_font, fill=MENU_SUBTEXT)
+    draw.text((180, 60), f"{streak}d", font=ImageFont.truetype(
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 26), fill=MENU_ACCENT)
+    draw.text((180, 90), "current streak", font=row_font, fill=MENU_SUBTEXT)
+
+    y = 120
+    draw.text((20, y), "MOST PLAYED", font=label_font, fill=MENU_SUBTEXT)
+    y += 20
+    for path, plays in stats.get_most_played(4):
+        title, artist = _track_label(tracks_by_path, path)
+        draw.text((20, y), f"{title[:30]}", font=row_font, fill=MENU_TEXT)
+        draw.text((WIDTH - 60, y), f"{plays}x", font=row_font, fill=MENU_ACCENT)
+        y += 18
+
+    y += 8
+    draw.text((20, y), "RECENTLY PLAYED", font=label_font, fill=MENU_SUBTEXT)
+    y += 20
+    for path in stats.get_recent(3):
+        title, artist = _track_label(tracks_by_path, path)
+        draw.text((20, y), f"{title[:34]}", font=row_font, fill=MENU_TEXT)
+        y += 18
+
+    draw.text((20, HEIGHT - 26), "Next: genre chart   Hold Prev: back", font=row_font, fill=MENU_SUBTEXT)
+    return img
+
+
+_PIE_COLORS = [
+    (232, 106, 38), (90, 160, 220), (120, 210, 130), (220, 90, 130),
+    (200, 180, 70), (150, 110, 220), (90, 200, 190), (220, 140, 90),
+]
+
+
+def _draw_genre_pie(tracks_by_path):
+    img = Image.new("RGB", (WIDTH, HEIGHT), MENU_BG)
+    draw = ImageDraw.Draw(img)
+    title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+    row_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13)
+
+    draw.text((20, 14), "Genre Breakdown", font=title_font, fill=MENU_TEXT)
+    draw.rectangle([0, 48, WIDTH, 49], fill=(50, 50, 58))
+
+    counts = {}
+    for t in tracks_by_path.values():
+        g = (t.get("genre") or "Unknown Genre").strip() or "Unknown Genre"
+        counts[g] = counts.get(g, 0) + 1
+    total = sum(counts.values())
+
+    if total == 0:
+        draw.text((20, 80), "No tracks in library.", font=row_font, fill=MENU_SUBTEXT)
+        return img
+
+    ordered = sorted(counts.items(), key=lambda kv: -kv[1])
+    cx, cy, r = 130, 175, 90
+    start_angle = -90.0
+    for i, (genre, count) in enumerate(ordered):
+        sweep = 360.0 * count / total
+        color = _PIE_COLORS[i % len(_PIE_COLORS)]
+        draw.pieslice([cx - r, cy - r, cx + r, cy + r], start_angle, start_angle + sweep, fill=color)
+        start_angle += sweep
+
+    legend_x, legend_y = 250, 70
+    for i, (genre, count) in enumerate(ordered[:8]):
+        color = _PIE_COLORS[i % len(_PIE_COLORS)]
+        yy = legend_y + i * 22
+        draw.rectangle([legend_x, yy + 3, legend_x + 12, yy + 15], fill=color)
+        pct = round(100 * count / total)
+        draw.text((legend_x + 18, yy), f"{genre[:16]} ({pct}%)", font=row_font, fill=MENU_TEXT)
+
+    draw.text((20, HEIGHT - 26), "Prev: back to stats   Hold Prev: exit", font=row_font, fill=MENU_SUBTEXT)
+    return img
+
+
+def run_stats_screen(buttons, tracks):
+    """Two-page stats view: summary (plays/streak/most-played/recent), then
+    a genre breakdown pie chart. Next/Prev (click) flips pages; hold-Prev
+    or hold-Play exits back to Settings -- same exit gesture as every other
+    sub-screen."""
+    tracks_by_path = {t["file_path"]: t for t in (tracks or [])}
+    page = 0
+    last_redraw = 0.0
+
+    while True:
+        now = time.monotonic()
+        if now - last_redraw > 0.2:
+            img = _draw_stats_summary(tracks_by_path) if page == 0 else _draw_genre_pie(tracks_by_path)
+            blit_rect_buf(0, 0, WIDTH, HEIGHT, img.tobytes())
+            last_redraw = now
+
+        clicks, holds, repeats = buttons.poll()
+        if "quad_click_pause" in holds: return "quad_click_pause"
+        for ev in holds:
+            if ev in ("prev", "play_pause"):
+                return
+        for ev in clicks:
+            if ev == "next" and page == 0:
+                page = 1
+                last_redraw = 0.0
+            elif ev == "prev" and page == 1:
+                page = 0
+                last_redraw = 0.0
         time.sleep(0.02)
 
 
@@ -1334,9 +1486,12 @@ def run_screen_off(buttons):
 
 
 def run_menu(bt, upload_srv, tracks, buttons, genre_worker=None):
+    log("MENU", "entered Menu Layout")
+    
+    if buttons: buttons.poll()
+        
     items = [("Library", "Browse by artist"), ("Settings", "Bluetooth & more")]
-    selected = 0
-    last_redraw = 0.0
+    selected, last_redraw = 0, 0.0
 
     while True:
         if time.monotonic() - last_redraw > 0.2:
@@ -1345,17 +1500,21 @@ def run_menu(bt, upload_srv, tracks, buttons, genre_worker=None):
             last_redraw = time.monotonic()
 
         clicks, holds, repeats = buttons.poll()
+        if "quad_click_pause" in holds: return "quad_click_pause"
         for ev in holds:
             if ev in ("prev", "play_pause"): return None
+            
         for ev in clicks:
             if ev == "next": selected = min(selected + 1, len(items) - 1)
             elif ev == "prev": selected = max(selected - 1, 0)
             elif ev == "play_pause":
                 if selected == 0:
                     chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
+                    if chosen == "quad_click_pause": return "quad_click_pause"
                     if chosen is not None: return chosen
                 elif selected == 1:
-                    run_settings_screen(bt, upload_srv, buttons, genre_worker, tracks)
+                    res = run_settings_screen(bt, upload_srv, buttons, genre_worker, tracks)
+                    if res == "quad_click_pause": return "quad_click_pause"
         time.sleep(0.02)
 
 
@@ -1370,8 +1529,7 @@ class ShuffleState:
     def _reshuffle(self, exclude_index=None):
         import random
         order = list(range(self.num_tracks))
-        if exclude_index is not None and exclude_index in order and self.num_tracks > 1:
-            order.remove(exclude_index)
+        if exclude_index is not None and exclude_index in order and self.num_tracks > 1: order.remove(exclude_index)
         random.shuffle(order)
         self._order = order
 
@@ -1408,12 +1566,10 @@ def draw_background_and_layout(track):
     fill_screen_rgb888(*bg)
 
     album_size = 160
-    album_x = (WIDTH - album_size) // 2 
-    album_y = 25 
+    album_x, album_y = (WIDTH - album_size) // 2, 25 
     spool_size = 48
     spool_y = album_y + album_size + 25 
     spool1_x, spool2_x = 180, 252
-    
     tape_x, tape_y, tape_w, tape_h = 204, spool_y + (spool_size // 2) - 1, 72, 2
 
     layout = {
@@ -1457,13 +1613,11 @@ def draw_background_and_layout(track):
     draw_text_ttf(20, 270 + 24, track.get("artist", "Unknown Artist"), theme["subtext"], bg, font_size=16, max_width=200)
 
     track_color = (int(bg[0]*0.5), int(bg[1]*0.5), int(bg[2]*0.5))
-    blit_rect_buf(tape_x, tape_y, tape_w, tape_h, make_solid_buf(tape_w, tape_h, *track_color))
     layout["track_color"] = track_color
 
     vol_w, vol_h = 180, 10
     layout.update({"vol_x": (WIDTH - vol_w) // 2, "vol_y": album_y + (album_size // 2) - 5, "vol_w": vol_w, "vol_h": vol_h, "last_vol": -1.0})
     draw_shuffle_icon(layout["shuffle_icon_x"], layout["shuffle_icon_y"], layout["shuffle_icon_size"], theme["accent"], bg, active=False)
-    
     blit_rect_buf(layout["asm_x"], layout["asm_y"], layout["asm_size"], layout["asm_size"], layout["asm_img"].tobytes())
 
     return layout
@@ -1531,17 +1685,16 @@ def play_single_track(player, track, buttons=None, shuffle=None, current_index=0
         meta_dur = get_duration_mutagen(track["file_path"])
         if meta_dur and meta_dur > 0: track["duration"] = meta_dur
 
-    player.load(track["file_path"])
-    player.play()
+    _, state, _ = player.playbin.get_state(0)
+    if state != Gst.State.PLAYING:
+        player.load(track["file_path"])
+        player.play()
     
-    # Non-blocking async loop to wait for engine initialization safely
     t0 = time.monotonic()
     while time.monotonic() - t0 < 5.0:
         _, state, _ = player.playbin.get_state(0)
-        if state == Gst.State.PLAYING:
-            break
-        if buttons:
-            buttons.poll() 
+        if state == Gst.State.PLAYING: break
+        if buttons: buttons.poll() 
         time.sleep(0.01)
 
     duration_secs = 0.0
@@ -1586,20 +1739,20 @@ def play_single_track(player, track, buttons=None, shuffle=None, current_index=0
                 spool_phase = (spool_phase + 2000) & 0xFFFF
                 layout["animator"].blit(layout["spool1_x"], layout["spool_y"], spool_phase)
                 layout["animator"].blit(layout["spool2_x"], layout["spool_y"], spool_phase)
-            if layout.get("vol_visible"): 
-                update_volume_bar(layout, player.get_volume())
+            if layout.get("vol_visible"): update_volume_bar(layout, player.get_volume())
             last_spin = now
 
         if buttons:
             clicks, holds, repeats = buttons.poll()
             vol_delta = 0.0
+            
+            if "quad_click_pause" in holds or any(c == "quad_click_pause" for c in clicks):
+                log("AUDIO", "Global emergency halt captured.")
+                player.pause()
+                is_playing = False
 
-            if "play_pause" in holds:
-                player.pause()
-                return "menu"
-            if "prev" in holds:
-                player.pause()
-                return "library"
+            if "play_pause" in holds: return "menu"
+            if "prev" in holds: return "library"
             if "next" in holds and shuffle is not None:
                 shuffle.toggle(current_index)
                 update_shuffle_icon(layout, shuffle.active)
@@ -1610,10 +1763,15 @@ def play_single_track(player, track, buttons=None, shuffle=None, current_index=0
                     is_playing = not is_playing
                 elif ev == "next":
                     player.stop()
+                    if duration_secs > 0 and pos_secs / duration_secs >= 0.5:
+                        stats.record_play(track["file_path"])
+                    else:
+                        stats.record_skip(track["file_path"])
                     return "next"
                 elif ev == "prev":
                     if pos_secs < 3.0:
                         player.stop()
+                        stats.record_skip(track["file_path"])
                         return "prev"
                     player.seek_to_start()
                 elif ev == "vol_up": vol_delta += 0.05
@@ -1628,7 +1786,9 @@ def play_single_track(player, track, buttons=None, shuffle=None, current_index=0
                 layout.update({"vol_visible": True, "vol_last_change": time.monotonic()})
                 update_volume_bar(layout, player.get_volume())
 
-        if duration_secs > 0 and pos_secs >= duration_secs: break
+        if duration_secs > 0 and pos_secs >= duration_secs:
+            stats.record_play(track["file_path"])
+            break
         
         if layout.get("vol_visible") and (time.monotonic() - layout["vol_last_change"] > 1.5):
             layout["vol_visible"] = False
@@ -1647,8 +1807,6 @@ def ui_loop():
 
     player = GstPlayer()
     player.set_volume(0.8)
-    
-    # Initialize the synchronized background handler thread mapping
     buttons = ButtonHandler(backlight, btn_play_pause_line, btn_next_line, btn_prev_line, btn_vol_up_line, btn_vol_down_line)
 
     bt = None
@@ -1668,8 +1826,7 @@ def ui_loop():
             if wifi_is_hotspot_active(): wifi_stop_hotspot()
 
     genre_worker = GenreFillWorker(wifi_get_status, log_fn=log)
-    if wifi_get_status()["connected"]: 
-        genre_worker.start(tracks, force_full=False)
+    if wifi_get_status()["connected"]: genre_worker.start(tracks, force_full=False)
         
     cache_worker = ThumbnailCacheWorker(log_fn=log)
     cache_worker.start(tracks)
@@ -1683,9 +1840,7 @@ def ui_loop():
         if not new_tracks: return None
         tracks = new_tracks
         shuffle = ShuffleState(len(tracks))
-        
-        if cache_worker.is_running:
-            cache_worker.stop()
+        if cache_worker.is_running: cache_worker.stop()
         cache_worker.start(tracks)
 
         if currently_playing_path is None: return 0
@@ -1695,8 +1850,8 @@ def ui_loop():
     try:
         chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
         rescanned_idx = rescan_if_needed(None)
-        if rescanned_idx is not None and chosen is None: chosen = rescanned_idx
-        while chosen is None: chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
+        if rescanned_idx is not None and (chosen is None or isinstance(chosen, str)): chosen = rescanned_idx
+        while chosen is None or isinstance(chosen, str): chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
         index = chosen
 
         while True:
@@ -1706,36 +1861,35 @@ def ui_loop():
             rescanned_idx = rescan_if_needed(current_track_path)
             if rescanned_idx is not None:
                 index = rescanned_idx
-                if genre_worker.is_running: 
-                    genre_worker.stop()
-                if wifi_get_status().get("connected"):
-                    genre_worker.start(tracks, force_full=False)
+                if genre_worker.is_running: genre_worker.stop()
+                if wifi_get_status().get("connected"): genre_worker.start(tracks, force_full=False)
 
+            if result == "quad_click_pause":
+                player.pause()
+                chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
+                if chosen is not None and isinstance(chosen, int): index = chosen
+                continue
+
+            # CRITICAL FIX HERE: Explicitly limit string checking strictly to menu context tokens
             if result in ("menu", "library"):
                 if result == "menu": chosen = run_menu(bt, upload_srv, tracks, buttons, genre_worker)
                 else: chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
                 
-                if chosen is not None:
-                    chosen_path = tracks[chosen]["file_path"]
-                    try: index = next(i for i, t in enumerate(tracks) if t["file_path"] == chosen_path)
-                    except StopIteration: index = chosen  
-                else:
-                    player.play()
+                if chosen == "quad_click_pause" or (chosen is not None and isinstance(chosen, str)):
+                    player.pause()
+                    chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
+
+                if chosen is not None and isinstance(chosen, int): index = chosen
                 continue
 
-            if shuffle.active:
-                index = shuffle.prev_index(index) if result == "prev" else shuffle.next_index(index)
-            else:
-                index = (index - 1) % len(tracks) if result == "prev" else (index + 1) % len(tracks)
+            if shuffle.active: index = shuffle.prev_index(index) if result == "prev" else shuffle.next_index(index)
+            else: index = (index - 1) % len(tracks) if result == "prev" else (index + 1) % len(tracks)
                 
     finally:
         buttons.stop()
-        if upload_srv.is_running(): 
-            upload_srv.stop()
-        if genre_worker.is_running:
-            genre_worker.stop()
-        if cache_worker.is_running:
-            cache_worker.stop()
+        if upload_srv.is_running(): upload_srv.stop()
+        if genre_worker.is_running: genre_worker.stop()
+        if cache_worker.is_running: cache_worker.stop()
 
 
 def main():
@@ -1749,6 +1903,8 @@ if __name__ == "__main__":
     try: main()
     except KeyboardInterrupt: pass
     finally:
+        try: stats.flush()
+        except Exception: pass
         try: fill_screen_rgb888(0, 0, 0)
         except Exception: pass
         try: backlight.shutdown()
