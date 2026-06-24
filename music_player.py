@@ -1,11 +1,15 @@
 import os
 import time
+import threading
+import queue
 import subprocess
 import spidev
 import gpiod
+import json
 import math
 import io
 import colorsys
+import re
 from PIL import Image, ImageFont, ImageDraw, ImageFilter
 try:
     from mutagen import File as MutagenFile
@@ -395,12 +399,23 @@ def build_track_from_file(path, default_image_path=None):
         if audio_full:
             tags_full = getattr(audio_full, "tags", None)
             if tags_full and hasattr(tags_full, "values"):
-                for frame in tags_full.values():
-                    if hasattr(frame, "data"):
-                        try:
-                            embedded_image = Image.open(io.BytesIO(frame.data)).convert("RGB")
-                            break
-                        except: pass
+                try: audio_full = MutagenFile(abs_path)
+                except Exception: audio_full = None
+
+                if audio_full:
+                    for key in audio_full.tags.keys():
+                        if key.startswith("APIC:"):
+                            try:
+                                embedded_image = Image.open(io.BytesIO(audio_full.tags[key].data)).convert("RGB")
+                                break
+                            except: pass
+
+            if embedded_image is None and hasattr(audio_full, "pictures"):
+                for pic in audio_full.pictures:
+                    try:
+                        embedded_image = Image.open(io.BytesIO(pic.data)).convert("RGB")
+                        break
+                    except: pass
             
             if embedded_image is None and hasattr(audio_full, "pictures"):
                 for pic in audio_full.pictures:
@@ -476,39 +491,120 @@ def format_time(sec):
 
 
 class ButtonHandler:
-    def __init__(self, *lines):
-        self.lines = {"play_pause": lines[0], "next": lines[1], "prev": lines[2], "vol_up": lines[3], "vol_down": lines[4]}
-        self.states = {name: {'raw': 1, 'pressed': False, 'start': time.monotonic(), 'long_fired': False, 'repeat': time.monotonic()} for name in self.lines}
+    def __init__(self, backlight_obj, *lines):
+        self.lines = {
+            "play_pause": lines[0], 
+            "next": lines[1], 
+            "prev": lines[2], 
+            "vol_up": lines[3], 
+            "vol_down": lines[4]
+        }
+        self.states = {
+            name: {
+                'raw': 1, 
+                'pressed': False, 
+                'start': 0.0, 
+                'long_fired': False, 
+                'repeat': 0.0
+            } for name in self.lines
+        }
+        
+        self.backlight = backlight_obj
+        self.event_queue = queue.Queue()
+        self._running = True
+        
+        self.last_interaction_time = time.monotonic()
+        self.screen_is_sleeping = False
+        self.prev_brightness = 100
+        self.dim_val = 10
+        
+        # Start background polling immediately
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="button-poll")
+        self._thread.start()
+
+    def _poll_loop(self):
+        """Centralized high-frequency loop implementing broad-envelope global inactivity dimming."""
+        IDLE_TIMEOUT_S = 120.0  # 2 Minutes global threshold timeout margin
+        
+        while self._running:
+            now = time.monotonic()
+            activity_detected = False
+            
+            for name, line in self.lines.items():
+                state = self.states[name]
+                try: 
+                    val = line.get_value()
+                except (OSError, ValueError): 
+                    continue
+                
+                # Button Press Detected (Falling Edge)
+                if state['raw'] == 1 and val == 0:
+                    state.update({'start': now, 'pressed': True, 'long_fired': False, 'repeat': now})
+                    self.last_interaction_time = now
+                    activity_detected = True
+                
+                # Button Release Detected (Rising Edge)
+                elif state['raw'] == 0 and val == 1:
+                    if (now - state['start']) >= 0.05 and not state['long_fired']: 
+                        # Only forward interactive frame events if display pipelines are fully illuminated
+                        if not self.screen_is_sleeping:
+                            self.event_queue.put(("click", name))
+                    state.update({'pressed': False, 'start': 0.0})
+                    self.last_interaction_time = now
+                    activity_detected = True
+                
+                # Handle active holds and repeats
+                if state['pressed'] and val == 0:
+                    activity_detected = True
+                    self.last_interaction_time = now
+                    if (now - state['start']) >= 0.5:
+                        if not state['long_fired']:
+                            state['long_fired'] = True
+                            if not self.screen_is_sleeping:
+                                self.event_queue.put(("hold", name))
+                            state['repeat'] = now
+                        elif now - state['repeat'] >= 0.15:
+                            if not self.screen_is_sleeping:
+                                self.event_queue.put(("repeat", name))
+                            state['repeat'] = now
+                            
+                state['raw'] = val
+
+            # --- GLOBAL ILLUMINATION TIMING LOOPS ---
+            if activity_detected and self.screen_is_sleeping:
+                self.screen_is_sleeping = False
+                self.backlight.fade_to(self.prev_brightness, duration_s=0.15)
+                # Flush execution filters instantly to absorb initial wake clicks cleanly
+                while not self.event_queue.empty():
+                    try: self.event_queue.get_nowait()
+                    except queue.Empty: break
+
+            elif not self.screen_is_sleeping and (now - self.last_interaction_time >= IDLE_TIMEOUT_S):
+                self.screen_is_sleeping = True
+                self.prev_brightness = self.backlight.get_brightness() or 100
+                self.backlight.fade_to(self.dim_val, duration_s=0.25)
+            
+            time.sleep(0.01)
 
     def poll(self):
         clicks, holds, repeats = [], [], []
-        now = time.monotonic() # Use a distinct variable for the timestamp
-        
-        for name, line in self.lines.items():
-            state = self.states[name]
-            try: val = line.get_value()
-            except OSError: continue
-            
-            if state['raw'] == 1 and val == 0:
-                # Store the timestamp using 'now'
-                state.update({'start': now, 'pressed': True, 'long_fired': False, 'repeat': now})
-            elif state['raw'] == 0 and val == 1:
-                # Compare against 'now'
-                if (now - state['start']) >= 0.05 and not state['long_fired']: 
+        while True:
+            try:
+                ev_type, name = self.event_queue.get_nowait()
+                if ev_type == "click":
                     clicks.append(name)
-                state.update({'pressed': False, 'start': 0.0})
-            
-            if state['pressed'] and val == 0:
-                if (now - state['start']) >= 0.5:
-                    if not state['long_fired']:
-                        state['long_fired'] = True
-                        holds.append(name)
-                        state['repeat'] = now
-                    elif now - state['repeat'] >= 0.15:
-                        repeats.append(name)
-                        state['repeat'] = now
-            state['raw'] = val
+                elif ev_type == "hold":
+                    holds.append(name)
+                elif ev_type == "repeat":
+                    repeats.append(name)
+            except queue.Empty:
+                break
         return clicks, holds, repeats
+
+    def stop(self):
+        self._running = False
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
 
 class SpoolAnimator:
@@ -752,7 +848,7 @@ def render_split_library_screen(title, items, selected_index):
 
     if items and selected_index < len(items):
         label, rep_track, subtext, meta = items[selected_index]
-        ref_track = rep_track[0] if isinstance(rep_track, list) else ref_track
+        ref_track = rep_track[0] if isinstance(rep_track, list) else rep_track
         if ref_track and "theme" in ref_track:
             right_bg = ref_track["theme"]["bg"]
             accent_col = ref_track["theme"]["accent"]
@@ -947,6 +1043,48 @@ def run_bluetooth_screen(bt, buttons):
         time.sleep(0.02)
 
 
+class ThumbnailCacheWorker:
+    def __init__(self, log_fn=print):
+        self.log = log_fn
+        self._thread = None
+        self.is_running = False
+        self._stop_event = threading.Event()
+
+    def start(self, tracks, sizes=[140, 160]):
+        if self.is_running:
+            return
+        self.is_running = True
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run, 
+            args=(tracks, sizes), 
+            daemon=True, 
+            name="thumbnail-cache"
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self.is_running = False
+
+    def _run(self, tracks, sizes):
+        self.log("CACHE", f"Starting background pre-cache for {len(tracks)} tracks...")
+        try:
+            for track in tracks:
+                if self._stop_event.is_set():
+                    break
+                for size in sizes:
+                    if self._stop_event.is_set():
+                        break
+                    _get_thumbnail(track, size)
+            self.log("CACHE", "Background pre-cache cycle complete.")
+        except Exception as e:
+            self.log("CACHE", f"Error during pre-cache execution: {e}")
+        finally:
+            self.is_running = False
+
 _thumb_cache = {}
 
 def _get_thumbnail(track, size):
@@ -1005,10 +1143,19 @@ def _get_collage_thumbnail(tracks, size):
     _thumb_cache[key] = collage
     return collage
 
+def _get_primary_artist(artist_string):
+    """Extracts only the first primary artist from a multi-artist string."""
+    if not artist_string:
+        return "Unknown Artist"
+    delimiters = r'(?i)\s+(feat\.?|ft\.?|featuring|vs\.?|with|and|\&)\s+|[,;/\\]+\s*'
+    primary = re.split(delimiters, artist_string)[0]
+    return primary.strip() or "Unknown Artist"
+
 def _group_tracks(tracks):
     by_artist = {}
     for i, t in enumerate(tracks):
-        artist = t.get("artist") or "Unknown Artist"
+        raw_artist = t.get("artist") or "Unknown Artist"
+        artist = _get_primary_artist(raw_artist)
         album = t.get("album") or "Unknown Album"
         by_artist.setdefault(artist, {}).setdefault(album, []).append((i, t))
     return by_artist
@@ -1164,12 +1311,11 @@ def run_settings_screen(bt, upload_srv, buttons, genre_worker=None, tracks=None)
                         except UploadServerUnavailable as e:
                             upload_error = "Flask not installed (see log)" if "Flask isn't installed" in str(e) else "Couldn't start"
                 
-                # Active on-demand button trigger execution layer
                 elif genre_item is not None and selected == len(items) - 1:
                     if not genre_worker.is_running:
                         if wifi_get_status()["connected"] and tracks:
-                            log("GENRE", "Manual trigger recognized. Spawning background parsing threads.")
-                            genre_worker.start(tracks)
+                            log("GENRE", "Manual trigger recognized. Overwriting all tracks.")
+                            genre_worker.start(tracks, force_full=True)
                         else:
                             log("GENRE", "On-demand execution aborted: Wi-Fi offline or empty library profile.")
         time.sleep(0.02)
@@ -1317,6 +1463,9 @@ def draw_background_and_layout(track):
     vol_w, vol_h = 180, 10
     layout.update({"vol_x": (WIDTH - vol_w) // 2, "vol_y": album_y + (album_size // 2) - 5, "vol_w": vol_w, "vol_h": vol_h, "last_vol": -1.0})
     draw_shuffle_icon(layout["shuffle_icon_x"], layout["shuffle_icon_y"], layout["shuffle_icon_size"], theme["accent"], bg, active=False)
+    
+    blit_rect_buf(layout["asm_x"], layout["asm_y"], layout["asm_size"], layout["asm_size"], layout["asm_img"].tobytes())
+
     return layout
 
 def update_shuffle_icon(layout, active):
@@ -1364,8 +1513,8 @@ def update_volume_bar(layout, volume):
     blit_rect_buf(asm_x, asm_y + slice_y_start, asm_size, slice_y_end - slice_y_start, frame.crop((0, slice_y_start, asm_size, slice_y_end)).tobytes())
 
 def update_current_time_label(layout, cur_secs, last_str=None):
-    cur_str = format_time(cur_secs)
-    if cur_str == last_str: return last_str
+    current_str = format_time(cur_secs)
+    if current_str == last_str: return last_str
 
     bg, accent = layout["bg"], layout["theme"]["accent"]
     clear_w, clear_h = 80, 24
@@ -1373,9 +1522,9 @@ def update_current_time_label(layout, cur_secs, last_str=None):
     except: font = ImageFont.load_default()
     
     img = Image.new("RGB", (clear_w, clear_h), bg)
-    ImageDraw.Draw(img).text((clear_w - ImageDraw.Draw(img).textbbox((0, 0), cur_str, font=font)[2], 0), cur_str, font=font, fill=accent)
+    ImageDraw.Draw(img).text((clear_w - ImageDraw.Draw(img).textbbox((0, 0), current_str, font=font)[2], 0), current_str, font=font, fill=accent)
     blit_rect_buf(WIDTH - clear_w - 20, layout["time_y"], clear_w, clear_h, img.tobytes())
-    return cur_str
+    return current_str
 
 def play_single_track(player, track, buttons=None, shuffle=None, current_index=0):
     if track.get("duration", 0) <= 0:
@@ -1384,9 +1533,19 @@ def play_single_track(player, track, buttons=None, shuffle=None, current_index=0
 
     player.load(track["file_path"])
     player.play()
-    player.wait_until_playing(timeout_s=5.0)
+    
+    # Non-blocking async loop to wait for engine initialization safely
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 5.0:
+        _, state, _ = player.playbin.get_state(0)
+        if state == Gst.State.PLAYING:
+            break
+        if buttons:
+            buttons.poll() 
+        time.sleep(0.01)
 
-    duration_secs, t0 = 0.0, time.perf_counter()
+    duration_secs = 0.0
+    t0 = time.perf_counter()
     while time.perf_counter() - t0 < 1.0:
         dur_ms = player.get_duration_ms()
         if 0 < dur_ms < 10_000_000:
@@ -1403,9 +1562,14 @@ def play_single_track(player, track, buttons=None, shuffle=None, current_index=0
 
     last_time_str, last_progress, spool_phase, last_spin, last_pos_poll = None, -1.0, 0, time.perf_counter(), 0.0
     pos_secs, progress, is_playing, action = 0.0, 0.0, True, "ended"
+    
+    if buttons:
+        buttons.poll()
+        buttons.last_interaction_time = time.monotonic()
 
     while True:
         now = time.perf_counter()
+        
         if now - last_pos_poll >= 0.05:
             last_pos_poll = now
             pos_secs = max(0, min(player.get_position_ms() / 1000.0, duration_secs)) if duration_secs > 0 else 0
@@ -1422,7 +1586,8 @@ def play_single_track(player, track, buttons=None, shuffle=None, current_index=0
                 spool_phase = (spool_phase + 2000) & 0xFFFF
                 layout["animator"].blit(layout["spool1_x"], layout["spool_y"], spool_phase)
                 layout["animator"].blit(layout["spool2_x"], layout["spool_y"], spool_phase)
-            if layout.get("vol_visible"): update_volume_bar(layout, player.get_volume())
+            if layout.get("vol_visible"): 
+                update_volume_bar(layout, player.get_volume())
             last_spin = now
 
         if buttons:
@@ -1482,7 +1647,9 @@ def ui_loop():
 
     player = GstPlayer()
     player.set_volume(0.8)
-    buttons = ButtonHandler(btn_play_pause_line, btn_next_line, btn_prev_line, btn_vol_up_line, btn_vol_down_line)
+    
+    # Initialize the synchronized background handler thread mapping
+    buttons = ButtonHandler(backlight, btn_play_pause_line, btn_next_line, btn_prev_line, btn_vol_up_line, btn_vol_down_line)
 
     bt = None
     try:
@@ -1501,8 +1668,11 @@ def ui_loop():
             if wifi_is_hotspot_active(): wifi_stop_hotspot()
 
     genre_worker = GenreFillWorker(wifi_get_status, log_fn=log)
-    if wifi_get_status()["connected"]: genre_worker.start(tracks)
-
+    if wifi_get_status()["connected"]: 
+        genre_worker.start(tracks, force_full=False)
+        
+    cache_worker = ThumbnailCacheWorker(log_fn=log)
+    cache_worker.start(tracks)
     shuffle = ShuffleState(len(tracks))
 
     def rescan_if_needed(currently_playing_path):
@@ -1513,6 +1683,11 @@ def ui_loop():
         if not new_tracks: return None
         tracks = new_tracks
         shuffle = ShuffleState(len(tracks))
+        
+        if cache_worker.is_running:
+            cache_worker.stop()
+        cache_worker.start(tracks)
+
         if currently_playing_path is None: return 0
         try: return next(i for i, t in enumerate(tracks) if t["file_path"] == currently_playing_path)
         except StopIteration: return 0
@@ -1526,31 +1701,42 @@ def ui_loop():
 
         while True:
             result = play_single_track(player, tracks[index], buttons, shuffle=shuffle, current_index=index)
+            current_track_path = tracks[index]["file_path"] if index < len(tracks) else None
+
+            rescanned_idx = rescan_if_needed(current_track_path)
+            if rescanned_idx is not None:
+                index = rescanned_idx
+                if genre_worker.is_running: 
+                    genre_worker.stop()
+                if wifi_get_status().get("connected"):
+                    genre_worker.start(tracks, force_full=False)
+
             if result in ("menu", "library"):
                 if result == "menu": chosen = run_menu(bt, upload_srv, tracks, buttons, genre_worker)
                 else: chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
-                chosen_path = tracks[chosen]["file_path"] if chosen is not None else None
-
-                rescanned_idx = rescan_if_needed(tracks[index]["file_path"])
-                if rescanned_idx is not None and chosen_path is None: index = rescanned_idx
-
-                if rescanned_idx is not None and genre_worker.is_running:
-                    genre_worker.stop()
-                    genre_worker.start(tracks)
-                elif not genre_worker.is_running and wifi_get_status()["connected"]:
-                    genre_worker.start(tracks)
-
-                if chosen_path is not None:
+                
+                if chosen is not None:
+                    chosen_path = tracks[chosen]["file_path"]
                     try: index = next(i for i, t in enumerate(tracks) if t["file_path"] == chosen_path)
                     except StopIteration: index = chosen  
-                elif rescanned_idx is None:
+                else:
                     player.play()
                 continue
 
-            index = (shuffle.prev_index(index) if result == "prev" else shuffle.next_index(index)) if shuffle.active else ((index - 1) % len(tracks) if result == "prev" else (index + 1) % len(tracks))
+            if shuffle.active:
+                index = shuffle.prev_index(index) if result == "prev" else shuffle.next_index(index)
+            else:
+                index = (index - 1) % len(tracks) if result == "prev" else (index + 1) % len(tracks)
+                
     finally:
-        if upload_srv.is_running(): upload_srv.stop()
-        if genre_worker.is_running: genre_worker.stop()
+        buttons.stop()
+        if upload_srv.is_running(): 
+            upload_srv.stop()
+        if genre_worker.is_running:
+            genre_worker.stop()
+        if cache_worker.is_running:
+            cache_worker.stop()
+
 
 def main():
     init_hardware()
