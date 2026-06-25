@@ -1,0 +1,60 @@
+# mishmann-player.service
+#
+# Auto-starts the Mishmann player on boot, running boot.py (not
+# music_player.py directly) so the splash/checks/diagnostics sequence
+# always runs first, same as a manual launch.
+#
+# INSTALL (run these on the device, as root or with sudo):
+#
+#   sudo cp mishmann-player.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable mishmann-player.service
+#   sudo systemctl start mishmann-player.service
+#
+# USEFUL COMMANDS:
+#   sudo systemctl status mishmann-player    # check if it's running
+#   sudo systemctl stop mishmann-player      # stop it (e.g. before manual debugging)
+#   sudo systemctl restart mishmann-player   # restart after pulling new code
+#   journalctl -u mishmann-player -f         # live log tail (same log() output you already see in a terminal)
+#   sudo systemctl disable mishmann-player   # turn off auto-start
+#
+# NOTE: while this service is enabled and running, the GPIO/SPI/audio
+# devices are held by this process. If you want to run boot.py manually
+# from a terminal for debugging, stop the service first
+# (`sudo systemctl stop mishmann-player`), or you'll get a "device busy"
+# style error since two processes can't both claim the same GPIO lines.
+
+[Unit]
+Description=Mishmann Player
+# Wait for these before starting -- the display/audio/network stack needs
+# to be up first, even though the player itself degrades gracefully if
+# WiFi/Bluetooth aren't ready yet (boot.py's own checks handle that).
+After=sound.target network-online.target multi-user.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rock
+Group=rock
+WorkingDirectory=/home/rock
+
+# Adjust this path if the project lives somewhere other than the home
+# directory's root -- this assumes boot.py sits directly in /home/rock
+# alongside music_player.py, upload_server.py, etc.
+ExecStart=/usr/bin/python3 /home/rock/boot.py
+
+# Restart automatically if it crashes (e.g. an unhandled exception), but
+# not in a tight loop if something is fundamentally broken -- cap restarts
+# rather than hammering a dead GPIO device forever.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Needed for GPIO/SPI/audio device access. The 'rock' user should already
+# be in these groups (gpio, spi, audio, video, etc.) from earlier setup --
+# this does not grant new permissions, just confirms what's expected.
+SupplementaryGroups=gpio spi audio video render plugdev
+
+[Install]
+WantedBy=multi-user.target

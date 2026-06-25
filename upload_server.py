@@ -17,11 +17,18 @@ except ImportError:
 
 _NMCLI_TIMEOUT_S = 10.0
 
+# ================================
+# HOTSPOT CONFIGURATION
+# ================================
+HOTSPOT_SSID = "Walkman Setup"
+HOTSPOT_PASSWORD = "walkman1979"
+HOTSPOT_GATEWAY_IP = "10.42.0.1"
+
 
 def wifi_get_status():
     try:
         result = subprocess.run(
-            ["sudo", "nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL", "dev", "wifi"],
+            ["nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL", "dev", "wifi"],
             capture_output=True, text=True, timeout=_NMCLI_TIMEOUT_S,
         )
         if result.returncode != 0:
@@ -42,10 +49,10 @@ def wifi_get_status():
 
 def wifi_scan():
     try:
-        subprocess.run(["sudo", "nmcli", "dev", "wifi", "rescan"],
+        subprocess.run(["nmcli", "dev", "wifi", "rescan"],
                         capture_output=True, text=True, timeout=_NMCLI_TIMEOUT_S)
         result = subprocess.run(
-            ["sudo", "nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi", "list"],
+            ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi", "list"],
             capture_output=True, text=True, timeout=_NMCLI_TIMEOUT_S,
         )
         if result.returncode != 0:
@@ -55,7 +62,7 @@ def wifi_scan():
             parts = line.split(":")
             if len(parts) < 3:
                 continue
-            ssid, signal_str, security = parts[0], parts[1], ":".join(parts[2:])
+            ssid, signal_str, security = parts[0], parts[1], parts[2]
             if not ssid:
                 continue
             try:
@@ -65,7 +72,8 @@ def wifi_scan():
             if ssid not in best or signal > best[ssid]["signal"]:
                 best[ssid] = {"ssid": ssid, "signal": signal, "security": security or "Open"}
         return sorted(best.values(), key=lambda n: -n["signal"])
-    except Exception:
+    except Exception as e:
+        print(f"[WIFI] wifi_scan failed: {e}", flush=True)
         return []
 
 
@@ -87,57 +95,76 @@ def wifi_connect(ssid, password):
         return False, f"Connection error: {e}"
 
 
-HOTSPOT_CON_NAME = "WalkmanSetup"
-HOTSPOT_SSID = "Walkman Setup"
-HOTSPOT_PASSWORD = "walkman123"
-HOTSPOT_GATEWAY_IP = "10.42.0.1"
-
-
+# ================================
+# HOTSPOT MANAGEMENT (nmcli)
+# ================================
 def wifi_is_hotspot_active():
+    """Checks if an active wireless connection contains hotspot or Walkman setup references."""
     try:
         result = subprocess.run(
             ["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"],
-            capture_output=True, text=True, timeout=_NMCLI_TIMEOUT_S,
+            capture_output=True, text=True, timeout=_NMCLI_TIMEOUT_S
         )
-        if result.returncode != 0:
-            return False
-        return any(line.split(":")[0] == HOTSPOT_CON_NAME for line in result.stdout.splitlines())
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                parts = line.split(":")
+                if len(parts) >= 2:
+                    name = parts[0]
+                    if "hotspot" in name.lower() or "setup" in name.lower():
+                        return True
+        return False
     except Exception:
         return False
 
 
 def wifi_start_hotspot():
-    if wifi_is_hotspot_active():
-        return True, "Hotspot already running."
+    """Starts the accessible Walkman Setup hotspot AP using standard nmcli syntax."""
     try:
+        if wifi_is_hotspot_active():
+            return True, "Hotspot already active."
+        
         result = subprocess.run(
-            ["nmcli", "dev", "wifi", "hotspot",
-             "con-name", HOTSPOT_CON_NAME,
-             "ssid", HOTSPOT_SSID,
-             "password", HOTSPOT_PASSWORD],
-            capture_output=True, text=True, timeout=_NMCLI_TIMEOUT_S,
+            ["nmcli", "device", "wifi", "hotspot", "ssid", HOTSPOT_SSID, "password", HOTSPOT_PASSWORD],
+            capture_output=True, text=True, timeout=_NMCLI_TIMEOUT_S
         )
         if result.returncode == 0:
-            return True, f"Hotspot '{HOTSPOT_SSID}' started."
-        reason = (result.stderr or result.stdout or "Unknown error").strip()
-        return False, f"Failed to start hotspot: {reason}"
-    except subprocess.TimeoutExpired:
-        return False, "Hotspot start timed out."
+            return True, "Hotspot started successfully."
+        
+        # Fallback if connection profile already exists but is inactive
+        result_fallback = subprocess.run(
+            ["nmcli", "connection", "up", "Hotspot"],
+            capture_output=True, text=True, timeout=_NMCLI_TIMEOUT_S
+        )
+        if result_fallback.returncode == 0:
+            return True, "Hotspot started successfully."
+            
+        return False, f"Failed to start hotspot: {result.stderr or result.stdout}"
     except Exception as e:
-        return False, f"Hotspot error: {e}"
+        return False, f"Error starting hotspot: {e}"
 
 
 def wifi_stop_hotspot():
+    """Stops and tears down any active wireless hotspot profile profile."""
     try:
-        subprocess.run(["nmcli", "connection", "down", HOTSPOT_CON_NAME],
-            capture_output=True, text=True, timeout=_NMCLI_TIMEOUT_S)
-        return True, "Hotspot stopped."
-    except Exception as e:
-        return False, f"Error stopping hotspot: {e}"
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "NAME,TYPE,ACTIVE", "connection", "show"],
+            capture_output=True, text=True, timeout=_NMCLI_TIMEOUT_S
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                parts = line.split(":")
+                if len(parts) >= 3:
+                    name, _, active = parts[0], parts[1], parts[2]
+                    if active == "yes" and ("hotspot" in name.lower() or "setup" in name.lower()):
+                        subprocess.run(["nmcli", "connection", "down", name], timeout=_NMCLI_TIMEOUT_S)
+                        return True
+        return False
+    except Exception:
+        return False
 
 
-ALLOWED_EXTENSIONS = {".mp3", ".flac", ".m4a", ".aac", ".wav"}
-MAX_UPLOAD_SIZE_BYTES = 500 * 1024 * 1024
+ALLOWED_EXTENSIONS = {".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wav"}
+MAX_UPLOAD_SIZE_BYTES = 500 * 1024 * 1024  # 500MB per request
 
 
 class UploadServerUnavailable(Exception):
@@ -164,8 +191,14 @@ UPLOAD_PAGE_HTML = """
   <title>Mishmann Upload</title>
   <style>
     :root {{
-      --bg: #18181e; --card: #24242c; --accent: #e86a26; --text: #f8fafc;
-      --text-mut: #94a3b8; --border: #3f3f46; --radius: 12px;
+      --bg: #18181e;
+      --card: #24242c;
+      --accent: #e86a26;
+      --accent-hover: #f97316;
+      --text: #f8fafc;
+      --text-mut: #94a3b8;
+      --border: #3f3f46;
+      --radius: 12px;
     }}
     body {{
       font-family: -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 20px;
@@ -246,7 +279,7 @@ UPLOAD_PAGE_HTML = """
       fileList.innerHTML = '';
       Array.from(fileInput.files).forEach(file => {{
         const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
-        fileList.innerHTML += `<div class="file-item"><span>\${{file.name}}</span><span style="color:var(--text-mut);">\ \${{sizeMB}} MB</span></div>`;
+        fileList.innerHTML += `<div class="file-item"><span>${{file.name}}</span><span style="color:var(--text-mut);">${{sizeMB}} MB</span></div>`;
       }});
       checkFormState();
     }});
@@ -263,7 +296,7 @@ UPLOAD_PAGE_HTML = """
           const percent = Math.round((e.loaded / e.total) * 100);
           progBar.style.width = percent + '%';
           progPercent.textContent = percent + '%';
-          progText.textContent = `Uploading... \${{(e.loaded / (1024*1024)).toFixed(1)}} / \${{(e.total / (1024*1024)).toFixed(1)}} MB`;
+          progText.textContent = `Uploading... ${{(e.loaded / (1024*1024)).toFixed(1)}} / ${{(e.total / (1024*1024)).toFixed(1)}} MB`;
         }}
       }};
       xhr.onload = () => {{
@@ -305,7 +338,9 @@ WIFI_PAGE_HTML = """
     .status-row {{ display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border); margin-bottom: 12px; }}
     .status-dot {{ width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; }}
     .dot-on {{ background: #4ade80; }} .dot-off {{ background: #6b7280; }}
-    .net-row {{ display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border); cursor: pointer; }}
+    .net-row {{ display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border); cursor: pointer; gap: 12px; overflow: hidden; }}
+    .net-name {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }}
+    .net-meta {{ flex-shrink: 0; font-size: 13px; color: var(--text-mut); white-space: nowrap; }}
     .net-row.selected {{ background: rgba(232, 106, 38, 0.1); border-radius: 8px; padding-left: 8px; }}
     .msg {{ padding: 14px; border-radius: 8px; font-size: 14px; margin-bottom: 16px; }}
     .msg.ok {{ background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.2); color: #86efac; }}
@@ -591,7 +626,7 @@ class MusicUploadServer:
                 rows.append(
                     f'<div class="net-row{" selected" if is_current else ""}" id="row-{n["ssid"]}" '
                     f'onclick="selectNetwork({n["ssid"]!r}, {n["security"]!r})">'
-                    f'<span class="net-name">{n["ssid"]}{"  (connected)" if is_current else ""}</span>'
+                    f'<span class="net-name">{n["ssid"]}{" (Connected)" if is_current else ""}</span>'
                     f'<span class="net-meta">{n["signal"]}%  ·  {n["security"]}</span>'
                     '</div>'
                 )

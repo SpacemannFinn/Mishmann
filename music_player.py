@@ -29,6 +29,8 @@ from upload_server import (
 from genre_fill import GenreFillWorker
 import stats
 import system_health
+import reliability
+import boot_history
 
 _LOG_T0 = time.monotonic()
 
@@ -354,10 +356,26 @@ def fill_screen_rgb888(r, g, b):
     dc_data()
     spi_write_bulk(bytes([r & 0xFF, g & 0xFF, b & 0xFF]) * (WIDTH * HEIGHT))
 
+_BLIT_SLOW_THRESHOLD_S = 0.05  # only log a blit if it took longer than this --
+                                # normal full-screen blits at 60MHz SPI should
+                                # be well under this; logging every blit would
+                                # flood the log and itself add overhead.
+_blit_count = 0
+_blit_total_time = 0.0
+
 def blit_rect_buf(x, y, w, h, buf):
+    global _blit_count, _blit_total_time
+    t0 = time.perf_counter()
     set_address_window(x, y, x + w - 1, y + h - 1)
     dc_data()
     spi_write_bulk(buf)
+    elapsed = time.perf_counter() - t0
+    _blit_count += 1
+    _blit_total_time += elapsed
+    if elapsed > _BLIT_SLOW_THRESHOLD_S:
+        avg_ms = (_blit_total_time / _blit_count) * 1000
+        log("BLIT", f"SLOW: {w}x{h} took {elapsed*1000:.1f}ms (x={x},y={y})  "
+                     f"[running avg over {_blit_count} blits: {avg_ms:.2f}ms]")
 
 def make_solid_buf(w, h, r, g, b):
     return bytes([r, g, b]) * (w * h)
@@ -456,6 +474,7 @@ def scan_music_folder(root_folder, default_image_path=None):
     tracks = []
     if not os.path.isdir(root_folder): return tracks
     for dirpath, dirnames, filenames in os.walk(root_folder):
+        dirnames[:] = [d for d in dirnames if d != reliability.QUARANTINE_DIRNAME]
         for name in sorted(filenames):
             if name.lower().endswith((".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wav")):
                 try: tracks.append(build_track_from_file(os.path.join(dirpath, name), default_image_path))
@@ -514,6 +533,7 @@ class ButtonHandler:
         self.backlight = backlight_obj
         self.event_queue = queue.Queue()
         self._running = True
+        self._last_emit_log = 0.0  # throttle so rapid repeats don't flood the log
         
         self.last_interaction_time = time.monotonic()
         self.screen_is_sleeping = False
@@ -526,14 +546,31 @@ class ButtonHandler:
         self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="button-poll")
         self._thread.start()
 
+    def _emit(self, kind, name, was_sleeping):
+        """Queue a button event AND log it the instant it's queued -- this is
+        the actual moment of "the button registered something," distinct
+        from whenever the consumer loop happens to drain it. Comparing this
+        timestamp against when the screen visually updates is what actually
+        isolates a button-side stall from a draw-side stall. Repeats are
+        throttled (one log line per 0.1s) so a held button doesn't flood
+        the log -- clicks/holds always log, since those are rare and the
+        ones that matter most for this kind of bug."""
+        now = time.monotonic()
+        if kind != "repeat" or (now - self._last_emit_log) >= 0.1:
+            log("BUTTON", f"{kind}:{name}  (screen_was_sleeping={was_sleeping}, "
+                          f"queue_depth_before={self.event_queue.qsize()})")
+            self._last_emit_log = now
+        self.event_queue.put((kind, name))
+
     def _poll_loop(self):
         """Centralized high-frequency loop implementing broad-envelope global inactivity dimming."""
         IDLE_TIMEOUT_S = 120.0  
-        
+
         while self._running:
             now = time.monotonic()
             activity_detected = False
-            
+            was_sleeping = self.screen_is_sleeping  # snapshot for accurate event logging
+
             for name, line in self.lines.items():
                 state = self.states[name]
                 try: 
@@ -556,13 +593,12 @@ class ButtonHandler:
                                 self.click_history.append(now)
                                 
                                 if len(self.click_history) >= 4:
-                                    self.event_queue.put(("quad_click_pause", name))
+                                    self._emit("quad_click_pause", name, was_sleeping)
                                     self.click_history.clear()
-                                elif not self.screen_is_sleeping:
-                                    self.event_queue.put(("click", name))
+                                else:
+                                    self._emit("click", name, was_sleeping)
                             else:
-                                if not self.screen_is_sleeping:
-                                    self.event_queue.put(("click", name))
+                                self._emit("click", name, was_sleeping)
                                 
                     state.update({'pressed': False, 'start': 0.0})
                     self.last_interaction_time = now
@@ -575,12 +611,10 @@ class ButtonHandler:
                     if (now - state['start']) >= 0.5:
                         if not state['long_fired']:
                             state['long_fired'] = True
-                            if not self.screen_is_sleeping:
-                                self.event_queue.put(("hold", name))
+                            self._emit("hold", name, was_sleeping)
                             state['repeat'] = now
                         elif now - state['repeat'] >= 0.15:
-                            if not self.screen_is_sleeping:
-                                self.event_queue.put(("repeat", name))
+                            self._emit("repeat", name, was_sleeping)
                             state['repeat'] = now
                             
                 state['raw'] = val
@@ -588,23 +622,37 @@ class ButtonHandler:
             # --- GLOBAL ILLUMINATION TIMING LOOPS ---
             if activity_detected and self.screen_is_sleeping:
                 self.screen_is_sleeping = False
+                log("BUTTON", "wake: starting blocking fade_to -- button reads paused until this returns")
+                t_fade0 = time.perf_counter()
                 self.backlight.fade_to(self.prev_brightness, duration_s=0.15)
-                while not self.event_queue.empty():
-                    try: self.event_queue.get_nowait()
-                    except queue.Empty: break
+                log("BUTTON", f"wake: fade_to returned after {(time.perf_counter()-t_fade0)*1000:.1f}ms, "
+                              f"resuming button reads")
+                # The press/hold/release that caused this wake is no longer
+                # suppressed (see edge-detection above) -- previously every
+                # event was gated on `not self.screen_is_sleeping`, which
+                # silently ate the very interaction that woke the screen,
+                # making the first press/hold after idle look like nothing
+                # happened. Now it's delivered normally, same as any other
+                # press, and the queue is left alone rather than cleared.
 
             elif not self.screen_is_sleeping and (now - self.last_interaction_time >= IDLE_TIMEOUT_S):
                 self.screen_is_sleeping = True
                 self.prev_brightness = self.backlight.get_brightness() or 100
+                log("BUTTON", f"idle timeout reached ({IDLE_TIMEOUT_S}s), dimming -- "
+                              f"button reads paused until fade_to returns")
+                t_fade0 = time.perf_counter()
                 self.backlight.fade_to(self.dim_val, duration_s=0.25)
+                log("BUTTON", f"dim: fade_to returned after {(time.perf_counter()-t_fade0)*1000:.1f}ms")
             
             time.sleep(0.01)
 
     def poll(self):
         clicks, holds, repeats = [], [], []
+        drained = 0
         while True:
             try:
                 ev_type, name = self.event_queue.get_nowait()
+                drained += 1
                 if ev_type == "quad_click_pause":
                     holds.append("quad_click_pause")
                 elif ev_type == "click":
@@ -615,6 +663,8 @@ class ButtonHandler:
                     repeats.append(name)
             except queue.Empty:
                 break
+        if drained:
+            log("BUTTON", f"poll() consumed {drained} event(s): clicks={clicks} holds={holds} repeats={repeats}")
         return clicks, holds, repeats
 
     def stop(self):
@@ -990,6 +1040,7 @@ def run_bluetooth_screen(bt, buttons):
     last_action_addr = None
     bt.start_scan()
     last_redraw = 0.0
+    last_rendered_items, last_rendered_selected = None, None
 
     while True:
         now = time.monotonic()
@@ -1043,10 +1094,13 @@ def run_bluetooth_screen(bt, buttons):
         selectable_devices.append("rescan")
 
         selected = max(0, min(selected, len(selectable_devices) - 1))
-        if now - last_redraw > 0.2:
+        content_changed = (items != last_rendered_items) or (selected != last_rendered_selected)
+        heartbeat_due = now - last_redraw > 1.0  # catches the "scanning…" label ticking even with no input
+        if content_changed or (heartbeat_due and now - last_redraw > 0.1):
             img = render_list_screen("Bluetooth", items, selected, footer="Hold Prev: back   Play: select")
             blit_rect_buf(0, 0, WIDTH, HEIGHT, img.tobytes())
             last_redraw = now
+            last_rendered_items, last_rendered_selected = items, selected
 
         for ev in clicks:
             if ev == "next":
@@ -1131,13 +1185,27 @@ def _get_thumbnail(track, size):
     cached = _thumb_cache.get(key)
     if cached is not None: return cached
 
+    t0 = time.perf_counter()
     try:
         thumb = src.copy()
         w, h = thumb.size
         side = min(w, h)
         thumb = thumb.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
+        # Large album art (1200px+ covers are common) made LANCZOS resize
+        # alone take hundreds of ms -- enough to visibly stall navigation on
+        # the first render of a never-before-thumbnailed artist/album. A
+        # cheap pre-downsample (BILINEAR via .thumbnail(), which itself uses
+        # a fast box filter for big reductions) gets close to the target
+        # size first; the final LANCZOS pass then only has to do fine
+        # resampling on an already-small image, which is fast.
+        if side > size * 2:
+            thumb.thumbnail((size * 2, size * 2), Image.BILINEAR)
         thumb = thumb.resize((size, size), Image.LANCZOS)
         _thumb_cache[key] = thumb
+        elapsed = time.perf_counter() - t0
+        if elapsed > 0.05:
+            log("THUMB", f"SLOW: resize from {w}x{h} -> {size}x{size} took {elapsed*1000:.1f}ms "
+                          f"(uncached, first render of this image)")
         return thumb
     except Exception: return None
 
@@ -1201,6 +1269,7 @@ def run_library_screen(tracks, buttons, bt=None, upload_srv=None, genre_worker=N
     cur_artist, cur_album = None, None
     selected = 0
     last_redraw = 0.0
+    last_rendered_items, last_rendered_selected = None, None
 
     while True:
         items = []
@@ -1233,10 +1302,17 @@ def run_library_screen(tracks, buttons, bt=None, upload_srv=None, genre_worker=N
         selected = max(0, min(selected, len(items) - 1)) if items else 0
 
         now = time.monotonic()
-        if now - last_redraw > 0.15:
+        content_changed = (items != last_rendered_items) or (selected != last_rendered_selected)
+        if content_changed:
+            t_render0 = time.perf_counter()
             img = render_split_library_screen(title, items or [("(empty)", None, "", "")], selected)
+            render_elapsed = time.perf_counter() - t_render0
+            if render_elapsed > 0.1:
+                log("LIBRARY", f"SLOW render: {render_elapsed*1000:.1f}ms for level={level} "
+                                f"selected={selected} ({len(items)} items)")
             blit_rect_buf(0, 0, WIDTH, HEIGHT, img.tobytes())
             last_redraw = now
+            last_rendered_items, last_rendered_selected = items, selected
 
         clicks, holds, repeats = buttons.poll()
         if "quad_click_pause" in holds: return "quad_click_pause"
@@ -1273,6 +1349,7 @@ def run_settings_screen(bt, upload_srv, buttons, genre_worker=None, tracks=None)
     bt_item = ("Bluetooth", "Pair & connect devices") if bt is not None else ("Bluetooth", "Unavailable on this device")
 
     selected, last_redraw = 0, 0.0
+    last_rendered_items, last_rendered_selected = None, None  # cache for change detection
     codec_status = get_active_bt_codec()
     last_codec_check = last_wifi_check = last_health_check = time.monotonic()
     upload_error = None
@@ -1333,10 +1410,13 @@ def run_settings_screen(bt, upload_srv, buttons, genre_worker=None, tracks=None)
         selected = max(0, min(selected, len(items) - 1))
 
         now = time.monotonic()
-        if now - last_redraw > 0.15:  
+        content_changed = (items != last_rendered_items) or (selected != last_rendered_selected)
+        heartbeat_due = now - last_redraw > 1.0  # catches Uptime/CPU-temp ticking even with no input
+        if content_changed or (heartbeat_due and now - last_redraw > 0.1):
             img = render_list_screen("Settings", items, selected, footer="Hold Prev: back   Play: select")
             blit_rect_buf(0, 0, WIDTH, HEIGHT, img.tobytes())
             last_redraw = now
+            last_rendered_items, last_rendered_selected = items, selected
 
         clicks, holds, repeats = buttons.poll()
         if "quad_click_pause" in holds: return "quad_click_pause"
@@ -1474,15 +1554,15 @@ def run_stats_screen(buttons, tracks):
     or hold-Play exits back to Settings -- same exit gesture as every other
     sub-screen."""
     tracks_by_path = {t["file_path"]: t for t in (tracks or [])}
-    page = 0
-    last_redraw = 0.0
+    page, last_redraw, last_rendered_page = 0, 0.0, None
 
     while True:
         now = time.monotonic()
-        if now - last_redraw > 0.2:
+        if page != last_rendered_page:
             img = _draw_stats_summary(tracks_by_path) if page == 0 else _draw_genre_pie(tracks_by_path)
             blit_rect_buf(0, 0, WIDTH, HEIGHT, img.tobytes())
             last_redraw = now
+            last_rendered_page = page
 
         clicks, holds, repeats = buttons.poll()
         if "quad_click_pause" in holds: return "quad_click_pause"
@@ -1496,6 +1576,121 @@ def run_stats_screen(buttons, tracks):
             elif ev == "prev" and page == 1:
                 page = 0
                 last_redraw = 0.0
+        time.sleep(0.02)
+
+
+def _draw_diagnostics_page1():
+    """Boot history: last boot's per-check results, plus any recorded
+    fatal failure history and flaky-check frequency across recent boots."""
+    img = Image.new("RGB", (WIDTH, HEIGHT), MENU_BG)
+    draw = ImageDraw.Draw(img)
+    title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+    label_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 13)
+    row_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+
+    draw.text((20, 14), "Diagnostics: Boot History", font=title_font, fill=MENU_TEXT)
+    draw.rectangle([0, 48, WIDTH, 49], fill=(50, 50, 58))
+
+    history = boot_history.get_history()
+    y = 62
+    if not history:
+        draw.text((20, y), "No boot history recorded yet.", font=row_font, fill=MENU_SUBTEXT)
+    else:
+        last = history[0]
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(last["timestamp"]))
+        draw.text((20, y), f"LAST BOOT: {ts}", font=label_font, fill=MENU_SUBTEXT)
+        y += 20
+        for check in last["checks"]:
+            color = (120, 210, 130) if check["ok"] else (220, 90, 90)
+            mark = "OK" if check["ok"] else "FAIL"
+            draw.text((20, y), check["label"], font=row_font, fill=MENU_TEXT)
+            mw = draw.textlength(mark, font=row_font)
+            draw.text((WIDTH - 24 - mw, y), mark, font=row_font, fill=color)
+            y += 17
+
+        freq = boot_history.get_failure_frequency()
+        flaky = sorted(freq.items(), key=lambda kv: -kv[1])[:3]
+        if flaky:
+            y += 6
+            draw.text((20, y), f"MOST FREQUENT FAILURES (last {len(history)} boots)",
+                      font=label_font, fill=MENU_SUBTEXT)
+            y += 18
+            for label, count in flaky:
+                draw.text((20, y), f"{label}: failed {count}x", font=row_font, fill=(220, 150, 90))
+                y += 17
+
+    draw.text((20, HEIGHT - 26), "Next: reliability   Hold Prev/Play: exit", font=row_font, fill=MENU_SUBTEXT)
+    return img
+
+
+def _draw_diagnostics_page2():
+    """Reliability data: current per-file failure counts and what's been
+    quarantined."""
+    img = Image.new("RGB", (WIDTH, HEIGHT), MENU_BG)
+    draw = ImageDraw.Draw(img)
+    title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+    label_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 13)
+    row_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+
+    draw.text((20, 14), "Diagnostics: Reliability", font=title_font, fill=MENU_TEXT)
+    draw.rectangle([0, 48, WIDTH, 49], fill=(50, 50, 58))
+
+    y = 62
+    failures = reliability.get_all_failure_counts()
+    draw.text((20, y), "CURRENT FAILURE STREAKS", font=label_font, fill=MENU_SUBTEXT)
+    y += 18
+    if not failures:
+        draw.text((20, y), "No tracks currently showing failures.", font=row_font, fill=MENU_TEXT)
+        y += 17
+    else:
+        for path, count in list(failures.items())[:8]:
+            name = os.path.basename(path)
+            draw.text((20, y), f"{name[:38]}", font=row_font, fill=MENU_TEXT)
+            draw.text((WIDTH - 50, y), f"{count}/{reliability.MAX_CONSECUTIVE_FAILURES}",
+                      font=row_font, fill=(220, 150, 90))
+            y += 17
+
+    y += 10
+    draw.text((20, y), "QUARANTINED THIS SESSION", font=label_font, fill=MENU_SUBTEXT)
+    y += 18
+    quarantined = getattr(reliability, "_quarantined_this_session", [])
+    if not quarantined:
+        draw.text((20, y), "None.", font=row_font, fill=MENU_TEXT)
+    else:
+        for path in quarantined[:6]:
+            draw.text((20, y), os.path.basename(path)[:42], font=row_font, fill=(220, 90, 90))
+            y += 17
+
+    draw.text((20, HEIGHT - 26), "Prev: back   Hold Prev/Play: exit", font=row_font, fill=MENU_SUBTEXT)
+    return img
+
+
+def run_diagnostics_screen(buttons):
+    """
+    Hidden screen, reached by holding Vol Up + Vol Down together (see
+    play_single_track) -- intentionally not advertised in any visible menu.
+    Two pages: boot-check history, then reliability/quarantine data.
+    """
+    log("DIAG", "entered hidden diagnostics screen")
+    page, last_redraw, last_rendered_page = 0, 0.0, None
+    while True:
+        now = time.monotonic()
+        if page != last_rendered_page:
+            img = _draw_diagnostics_page1() if page == 0 else _draw_diagnostics_page2()
+            blit_rect_buf(0, 0, WIDTH, HEIGHT, img.tobytes())
+            last_redraw = now
+            last_rendered_page = page
+
+        clicks, holds, repeats = buttons.poll()
+        for ev in holds:
+            if ev in ("prev", "play_pause"):
+                log("DIAG", "exiting hidden diagnostics screen")
+                return
+        for ev in clicks:
+            if ev == "next" and page == 0:
+                page = 1
+            elif ev == "prev" and page == 1:
+                page = 0
         time.sleep(0.02)
 
 
@@ -1517,13 +1712,14 @@ def run_menu(bt, upload_srv, tracks, buttons, genre_worker=None):
     if buttons: buttons.poll()
         
     items = [("Library", "Browse by artist"), ("Settings", "Bluetooth & more")]
-    selected, last_redraw = 0, 0.0
+    selected, last_redraw, last_rendered_selected = 0, 0.0, None
 
     while True:
-        if time.monotonic() - last_redraw > 0.2:
+        if selected != last_rendered_selected:
             img = render_list_screen("Menu", items, selected, footer="Hold Play: resume   Play: select")
             blit_rect_buf(0, 0, WIDTH, HEIGHT, img.tobytes())
             last_redraw = time.monotonic()
+            last_rendered_selected = selected
 
         clicks, holds, repeats = buttons.poll()
         if "quad_click_pause" in holds: return "quad_click_pause"
@@ -1715,13 +1911,36 @@ def play_single_track(player, track, buttons=None, shuffle=None, current_index=0
     if state != Gst.State.PLAYING:
         player.load(track["file_path"])
         player.play()
-    
+
     t0 = time.monotonic()
+    load_failed = False
     while time.monotonic() - t0 < 5.0:
-        _, state, _ = player.playbin.get_state(0)
-        if state == Gst.State.PLAYING: break
-        if buttons: buttons.poll() 
+        state_change_return, state, _ = player.playbin.get_state(0)
+        if state == Gst.State.PLAYING:
+            break
+        if state_change_return == Gst.StateChangeReturn.FAILURE:
+            load_failed = True
+            break
+        if buttons: buttons.poll()
         time.sleep(0.01)
+    else:
+        # Loop ran the full 5s without reaching PLAYING or FAILURE -- e.g. a
+        # hung/corrupt file that never resolves either way. Treat the same
+        # as a failure rather than falling through into a UI for a track
+        # that was never actually confirmed playing.
+        _, state, _ = player.playbin.get_state(0)
+        load_failed = state != Gst.State.PLAYING
+
+    if load_failed:
+        player.stop()
+        count = reliability.record_failure(track["file_path"])
+        log("RELIABILITY", f"playback failed for {track['file_path']!r} "
+                            f"({count}/{reliability.MAX_CONSECUTIVE_FAILURES})")
+        if reliability.should_quarantine(track["file_path"]):
+            reliability.quarantine_file(track["file_path"], log=log)
+        return "load_failed"
+
+    reliability.record_success(track["file_path"])
 
     duration_secs = 0.0
     t0 = time.perf_counter()
@@ -1745,6 +1964,9 @@ def play_single_track(player, track, buttons=None, shuffle=None, current_index=0
     if buttons:
         buttons.poll()
         buttons.last_interaction_time = time.monotonic()
+
+    last_vol_up_hold_t, last_vol_down_hold_t = -999.0, -999.0  # for the hidden
+    COMBO_WINDOW_S = 0.3  # diagnostics-menu combo: hold Vol Up + Vol Down together
 
     while True:
         now = time.perf_counter()
@@ -1782,6 +2004,26 @@ def play_single_track(player, track, buttons=None, shuffle=None, current_index=0
             if "next" in holds and shuffle is not None:
                 shuffle.toggle(current_index)
                 update_shuffle_icon(layout, shuffle.active)
+
+            # Hidden diagnostics menu: hold Vol Up and Vol Down together
+            # (within a short window of each other, since two real button
+            # presses are never perfectly simultaneous). Deliberately not
+            # advertised anywhere in the normal UI -- this is for your own
+            # troubleshooting, not a feature a casual user should stumble
+            # into by holding volume buttons during normal use.
+            now_combo = time.monotonic()
+            if "vol_up" in holds: last_vol_up_hold_t = now_combo
+            if "vol_down" in holds: last_vol_down_hold_t = now_combo
+            if abs(last_vol_up_hold_t - last_vol_down_hold_t) <= COMBO_WINDOW_S and \
+               now_combo - max(last_vol_up_hold_t, last_vol_down_hold_t) <= COMBO_WINDOW_S and \
+               last_vol_up_hold_t > 0 and last_vol_down_hold_t > 0:
+                last_vol_up_hold_t, last_vol_down_hold_t = -999.0, -999.0  # consume, avoid re-triggering
+                log("DIAG", "hidden diagnostics combo detected (hold Vol+ and Vol- together)")
+                player.pause()
+                is_playing = False
+                run_diagnostics_screen(buttons)
+                player.play()
+                is_playing = True
 
             for ev in clicks:
                 if ev == "play_pause":
@@ -1906,6 +2148,20 @@ def ui_loop():
                     chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
 
                 if chosen is not None and isinstance(chosen, int): index = chosen
+                continue
+
+            if result == "load_failed":
+                # Already recorded/quarantined inside play_single_track.
+                # Re-scan if a quarantine just happened so the dead file
+                # actually disappears from `tracks`, not just from disk.
+                fresh = scan_music_folder(MUSIC_ROOT, default_image_path=DEFAULT_ART_PATH)
+                if fresh:
+                    tracks[:] = fresh
+                    index = index % len(tracks)
+                else:
+                    log("RELIABILITY", "library is empty after quarantine, returning to Library screen")
+                    chosen = run_library_screen(tracks, buttons, bt, upload_srv, genre_worker)
+                    if chosen is not None and isinstance(chosen, int): index = chosen
                 continue
 
             if shuffle.active: index = shuffle.prev_index(index) if result == "prev" else shuffle.next_index(index)

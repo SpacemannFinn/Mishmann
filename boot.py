@@ -10,6 +10,7 @@ import math
 from PIL import Image, ImageDraw, ImageFont
 
 import music_player as mp
+import boot_history
 
 BG_COLOR = mp.MENU_BG
 ACCENT_COLOR = mp.MENU_ACCENT
@@ -219,7 +220,9 @@ def run_boot_sequence():
     
     label, fn, critical = CHECKS[0]
     ok, msg = fn()
-    if not ok: sys.exit(1)
+    if not ok:
+        boot_history.record_boot([(label, False, msg)], fatal=(label, msg))
+        sys.exit(1)
 
     current_angle = 0.0
     draw_boot_frame(results=None, spool_angle=current_angle, anim_progress=0.0)
@@ -228,6 +231,7 @@ def run_boot_sequence():
     current_angle = run_transition_animation()
     
     results = [(label, True)] + [(lbl, None) for lbl, _, _ in CHECKS[1:]]
+    results_with_messages = [(label, True, msg)]
     fatal = None
     
     for i, (label, fn, critical) in enumerate(CHECKS[1:], start=1):
@@ -235,11 +239,14 @@ def run_boot_sequence():
         current_angle += 35.0
         ok, msg = fn()
         results[i] = (label, ok)
+        results_with_messages.append((label, ok, msg))
         draw_boot_frame(results, in_progress_label=f"COMPLETED CHANNELS: {label.upper()}", spool_angle=current_angle, anim_progress=1.0)
         if not ok and critical:
             fatal = (label, msg)
             break
         time.sleep(0.08)
+
+    boot_history.record_boot(results_with_messages, fatal=fatal)
 
     if fatal:
         label, msg = fatal

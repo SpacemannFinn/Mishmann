@@ -158,6 +158,116 @@ def write_genre_tag(file_path, genre, log=print):
         log("GENRE", f"Failed to write tag to {file_path}: {e}")
         return False
 
+
+COVER_ART_BASE_URL = "https://coverartarchive.org/release/"
+COVER_ART_SIZE = "500"  # CAA supports 250/500/1200 -- 500px is plenty for a
+                         # 480x320 panel's 160px album art, no point fetching
+                         # the full 1200px and paying the bandwidth/decode cost
+
+
+def _mb_get_bytes(url):
+    """Like _mb_get, but for binary responses (actual image data) rather
+    than JSON -- Cover Art Archive redirects to a raw image, not a JSON
+    payload, so this can't reuse _mb_get's json.loads call. Shares the same
+    rate limiter (the module-level lock/timestamp), since this still counts
+    as a request against an external service even though CAA itself
+    currently has no published rate limit -- no reason to hammer it anyway.
+    Returns raw bytes, or None on any failure (404 for "no cover art" is
+    expected and common, not a real error)."""
+    global _last_request_time
+    with _network_lock:
+        now = time.monotonic()
+        delta = now - _last_request_time
+        if delta < MIN_REQUEST_INTERVAL_S:
+            time.sleep(MIN_REQUEST_INTERVAL_S - delta)
+        _last_request_time = time.monotonic()
+
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.read()
+    except Exception:
+        return None  # includes the common/expected 404 (no art for this release)
+
+
+def find_release_mbid(artist_name, album, log=None):
+    """Searches MusicBrainz for a release matching artist+album, returns its
+    MBID, or None. This is independent of lookup_genre_by_metadata's own
+    recording search -- that search doesn't request release info, so cover
+    art needs its own lookup rather than trying to reuse genre-fill's path."""
+    if not artist_name or not album:
+        return None
+    query = f'release:"{album}" AND artist:"{artist_name}"'
+    url = f"{MB_BASE_URL}release?query={urllib.parse.quote(query)}&fmt=json&limit=1"
+    data = _mb_get(url)
+    if not data:
+        return None
+    releases = data.get("releases", [])
+    return releases[0]["id"] if releases else None
+
+
+def fetch_cover_art(artist_name, album, log=None):
+    """
+    Looks up a release MBID for artist+album, then fetches its front cover
+    from the Cover Art Archive. Returns raw image bytes, or None if no
+    release was found, no cover art exists for it (common -- not every
+    release has art submitted), or any request failed. Never raises.
+    """
+    mbid = find_release_mbid(artist_name, album, log=log)
+    if not mbid:
+        return None
+    img_bytes = _mb_get_bytes(f"{COVER_ART_BASE_URL}{mbid}/front-{COVER_ART_SIZE}")
+    if img_bytes and log:
+        log("ART", f"found cover art for {artist_name!r} - {album!r} (release {mbid})")
+    return img_bytes
+
+
+def write_cover_art_tag(file_path, image_bytes, log=print):
+    """
+    Embeds image_bytes as the front-cover picture in the file's own tag,
+    format-aware like write_genre_tag. Never touches genre or any other
+    existing tag field -- only adds art where there was none.
+    """
+    try:
+        if file_path.lower().endswith(".mp3"):
+            from mutagen.id3 import ID3, APIC, ID3NoHeaderError
+            try:
+                tags = ID3(file_path)
+            except ID3NoHeaderError:
+                tags = ID3()
+            tags.delall("APIC")  # only relevant if called on a file that
+                                  # somehow has a broken/unreadable APIC but
+                                  # no PIL-visible embedded_image; safe no-op
+                                  # otherwise since this path is only used
+                                  # when embedded_image was already None
+            tags.add(APIC(encoding=3, mime="image/jpeg", type=3,
+                           desc="Cover", data=image_bytes))
+            tags.save(file_path)
+        elif file_path.lower().endswith(".flac"):
+            from mutagen.flac import FLAC, Picture
+            audio = MutagenFile(file_path)
+            if audio is None: return False
+            pic = Picture()
+            pic.data = image_bytes
+            pic.type = 3
+            pic.mime = "image/jpeg"
+            audio.clear_pictures()
+            audio.add_picture(pic)
+            audio.save()
+        else:
+            # MP4/M4A and others: mutagen's generic interface for cover art
+            # varies enough by format that attempting a universal write
+            # here risks corrupting tags on a format we haven't tested
+            # against. Skip rather than guess.
+            if log:
+                log("ART", f"skipping art write for unsupported format: {file_path}")
+            return False
+        return True
+    except Exception as e:
+        log("ART", f"Failed to write cover art to {file_path}: {e}")
+        return False
+
+
 class GenreFillWorker:
     def __init__(self, get_wifi_status_fn, log_fn=print):
         self.get_wifi_status = get_wifi_status_fn
@@ -167,6 +277,7 @@ class GenreFillWorker:
         self.is_running = False
         self.tracks_checked = 0
         self.tracks_filled = 0
+        self.art_filled = 0
 
     def start(self, tracks, force_full=False):
         """Starts worker. force_full=False targets untagged tracks only."""
@@ -174,6 +285,7 @@ class GenreFillWorker:
             return
         self.tracks_checked = 0
         self.tracks_filled = 0
+        self.art_filled = 0
         self.is_running = True
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, args=(tracks, force_full), daemon=True)
@@ -189,19 +301,46 @@ class GenreFillWorker:
             for track in tracks:
                 if self._stop_event.is_set(): break
                 if not self.get_wifi_status().get("connected"): break
-                
+
                 current_genre = track.get("genre", "")
-                if not force_full and current_genre and current_genre.lower() != "unknown genre":
+                needs_genre = force_full or not current_genre or current_genre.lower() == "unknown genre"
+                # Only fetch art when there's truly none -- a generic
+                # default placeholder (image_path set but no embedded_image)
+                # still counts as "no real art for this track", so check
+                # embedded_image specifically, not whether art_path exists.
+                needs_art = track.get("embedded_image") is None
+
+                if not needs_genre and not needs_art:
                     continue
-                
+
                 self.tracks_checked += 1
                 meta = get_file_metadata(track["file_path"])
-                if meta:
+                if not meta:
+                    continue
+
+                if needs_genre:
                     genre = lookup_genre_by_metadata(meta)
                     if genre:
                         if write_genre_tag(track["file_path"], genre, self.log):
                             track["genre"] = genre
                             self.tracks_filled += 1
                             self.log("GENRE", f"Filled: {track['file_path']} -> {genre}")
+
+                if self._stop_event.is_set(): break
+                if not self.get_wifi_status().get("connected"): break
+
+                if needs_art:
+                    img_bytes = fetch_cover_art(meta.get("artist"), meta.get("album"), log=self.log)
+                    if img_bytes:
+                        if write_cover_art_tag(track["file_path"], img_bytes, self.log):
+                            try:
+                                from PIL import Image
+                                import io
+                                track["embedded_image"] = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                                self.art_filled += 1
+                                self.log("ART", f"Filled cover art: {track['file_path']}")
+                            except Exception as e:
+                                self.log("ART", f"wrote art tag but failed to decode for "
+                                                 f"in-memory update: {e}")
         finally:
             self.is_running = False
